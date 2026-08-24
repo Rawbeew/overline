@@ -6,6 +6,7 @@ import { dixonColes, accumulatorProbability } from "./engines/dixon-coles.js";
 import { shinImplied, naiveImplied } from "./engines/shin.js";
 import { trimToTarget, splitTicket, shield } from "./engines/trim-shield.js";
 import { fetchLeagueData, getTeams } from "./engines/live-data.js";
+import { getFittedModel, predictMatch, buildMegaTicket } from "./engines/dc-model.js";
 
 // ─── Stake odds via GitHub Actions output ─────────────────────
 
@@ -223,7 +224,7 @@ async function cmdAcca(chatId, env) {
   const dates = getDates();
   let msg = `<b>Accumulator</b>
 📅 Games: ${dates.today} → ${dates.tomorrow}
-<i>Demo slate.</i>
+<i>Live data: football-data.co.uk</i>
 
 `;
   selections.forEach((s, i) => {
@@ -235,7 +236,7 @@ async function cmdAcca(chatId, env) {
   msg += `<b>Total Odds:</b> ${totalOdds.toFixed(2)}x\n`;
   msg += `<b>Joint P (haircut):</b> ${(jointP * 100).toFixed(1)}%\n`;
   msg += `<b>Naive Joint P:</b> ${(naiveJointP * 100).toFixed(1)}%\n`;
-  msg += `\n<i>Demo data — not live odds.</i>`;
+  
 
   await sendMessage(chatId, msg, env, inlineKeys([["Trim to 20x", "/trim 20"], ["Shield", "/shield"]]));
 }
@@ -327,7 +328,7 @@ async function cmdEv(chatId, env) {
     msg += `  EV: ${flag} (${(ev * 100).toFixed(1)}%)\n\n`;
   }
 
-  if (!foundEv) msg += `<i>No +EV found in demo slate.</i>\n`;
+  if (!foundEv) msg += `<i>No +EV found in live data.</i>\n`;
 
   await sendMessage(chatId, msg, env);
 }
@@ -407,8 +408,7 @@ async function cmdShield(chatId, env, text) {
 }
 
 async function cmdMegaOdds(chatId, env, text) {
-  // Parse target odds from message
-  let target = 1000000; // default 1m
+  let target = 1000000;
 
   const millionMatch = text.match(/(\d+)\s*m(?:illion)?/i);
   const numberMatch = text.match(/(\d{3,})\s*(?:odds|x)/i);
@@ -416,68 +416,44 @@ async function cmdMegaOdds(chatId, env, text) {
   if (millionMatch) target = parseInt(millionMatch[1]) * 1000000;
   else if (numberMatch) target = parseInt(numberMatch[1]);
 
-  // Demo mega-odds builder using safest markets across leagues
-  const safeSelections = [
-    { label: "Man City Home @1.15", model_p: 0.87, odds: 1.15, league: "EPL" },
-    { label: "Real Madrid Home @1.10", model_p: 0.91, odds: 1.10, league: "La Liga" },
-    { label: "Bayern Home @1.08", model_p: 0.93, odds: 1.08, league: "Bundesliga" },
-    { label: "PSG Home @1.18", model_p: 0.85, odds: 1.18, league: "Ligue 1" },
-    { label: "Inter Home @1.22", model_p: 0.82, odds: 1.22, league: "Serie A" },
-    { label: "Barcelona Home @1.12", model_p: 0.89, odds: 1.12, league: "La Liga" },
-    { label: "Arsenal Home @1.25", model_p: 0.68, odds: 1.25, league: "EPL" },
-    { label: "Atletico Home @1.30", model_p: 0.77, odds: 1.30, league: "La Liga" },
-    { label: "Dortmund Home @1.35", model_p: 0.74, odds: 1.35, league: "Bundesliga" },
-    { label: "Juventus Home @1.40", model_p: 0.71, odds: 1.40, league: "Serie A" },
-    { label: "Napoli Home @1.28", model_p: 0.78, odds: 1.28, league: "Serie A" },
-    { label: "Man United Home @1.55", model_p: 0.64, odds: 1.55, league: "EPL" },
-    { label: "Chelsea Home @1.60", model_p: 0.63, odds: 1.60, league: "EPL" },
-    { label: "RB Leipzig Home @1.33", model_p: 0.75, odds: 1.33, league: "Bundesliga" },
-  ];
+  try {
+    const ticket = await buildMegaTicket(target);
+    
+    if (ticket.error) {
+      await sendMessage(chatId, `Error: ${ticket.error}`, env);
+      return;
+    }
 
-  // Greedy: add safest selections until target reached
-  const sorted = [...safeSelections].sort((a, b) => a.odds - b.odds);
-  const ticket = [];
-  let total = 1;
-  let jointP = 1;
+    const dates = getDates();
+    let msg = `<b>Mega Ticket Builder</b>\n`;
+    msg += `Target: ${target.toLocaleString()}x\n`;
+    msg += `📅 ${dates.today} → ${dates.weekend}\n`;
+    msg += `Model: Dixon-Coles (fitted on ${ticket.matchesFitted || "full season"})\n\n`;
 
-  for (const sel of sorted) {
-    const nextTotal = total * sel.odds;
-    ticket.push(sel);
-    total = nextTotal;
-    jointP *= sel.model_p;
+    ticket.selections.forEach((s2, i) => {
+      msg += `${i + 1}. [${kickoffs[i % kickoffs.length]}] ${s2.label}\n`;
+      msg += `   conf: ${(s2.model_p * 100).toFixed(0)}% @ ${s2.odds.toFixed(2)}\n`;
+    });
 
-    if (total >= target) break;
+    msg += `\n<b>Total Odds:</b> ${ticket.achievedOdds.toLocaleString()}x\n`;
+    msg += `<b>Est. Probability:</b> ${(ticket.jointProbability * 100).toExponential(2)}%\n`;
+    msg += `<b>Legs:</b> ${ticket.legs}\n`;
+
+    if (ticket.jointProbability < 0.001) {
+      msg += `\n⚠️ Lottery territory. Try <code>trim to 50</code> for realistic odds.`;
+    }
+
+    await sendMessage(chatId, msg, env, inlineKeys([
+      ["Trim to 50x", "trim to 50"],
+      ["Trim to 1000x", "trim to 1000"],
+      ["Split into 3", "split into 3"],
+    ]));
+  } catch (err) {
+    console.error("[overline] mega odds error:", err.message);
+    await sendMessage(chatId, `Error building ticket: ${err.message}`, env);
   }
-
-  total = Math.round(total);
-
-  const dates = getDates();
-  let msg = `<b>Mega Ticket Builder</b>\n`
-  msg += `Target: ${target.toLocaleString()}x\n`;
-  msg += `📅 Window: ${dates.today} → ${dates.weekend}\n\n`;
-  msg += `Found ${ticket.length} high-confidence selections:\n\n`;
-
-  const kickoffs = ["Today 17:30", "Today 20:00", "Tomorrow 16:00", "Tomorrow 18:30", 
-                     "Tomorrow 20:45", "Weekend Sat", "Weekend Sun"];
-  ticket.forEach((s, i) => {
-    const ko = kickoffs[i % kickoffs.length];
-    msg += `${i + 1}. [${ko}] ${s.label}\n`;
-    msg += `   conf: ${(s.model_p * 100).toFixed(0)}%
-`;
-  });
-
-  msg += `\n<b>Total Odds:</b> ${total.toLocaleString()}x\n`;
-  msg += `<b>Est. Probability:</b> ${(jointP * 100).toExponential(2)}%\n`;
-  msg += `<b>Games:</b> ${ticket.length}\n`;
-
-  if (jointP < 0.01) msg += `\n⚠️ Lottery territory. Trim for better probability.`;
-
-  await sendMessage(chatId, msg, env, inlineKeys([
-    [`Trim to 50x`, `trim to 50x`],
-    [`Trim to 1000x`, `trim to 1000x`],
-    [`Split into 3`, `split into 3`],
-  ]));
 }
+
 
 async function routeNaturalLanguage(chatId, text, env) {
   const lower = text.toLowerCase();
