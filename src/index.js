@@ -120,6 +120,7 @@ async function handleUpdate(update, env) {
   if (!update.message) return;
   const chatId = update.message.chat.id;
   const text = update.message.text || "";
+  const lower = text.toLowerCase();
 
   try {
     await sendTyping(chatId, env);
