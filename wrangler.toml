@@ -1,0 +1,7 @@
+name = "overline"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[vars]
+BOT_USERNAME = "Onehundredandonebot"
+OVERLINE_BOT_TOKEN = "8862566723:AAFmBN9_8y2fIseREiSZxXQV-fo_2y5-Bes"
