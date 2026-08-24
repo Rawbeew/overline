@@ -457,20 +457,148 @@ async function cmdMegaOdds(chatId, env, text) {
 
 
 async function routeNaturalLanguage(chatId, text, env) {
-  const lower = text.toLowerCase();
+  const lower = text.toLowerCase().trim();
 
-  if (/convert\s+\w+\s+(from|on)\s+sportybet/i.test(lower)) {
-    await sendMessage(chatId,
-      "<b>Code Converter</b>\n\nSportyBet code conversion requires their booking API.\nLive book feed wiring in progress — no live book feed.\n\n<i>Coming soon.</i>", env);
-  } else if (/predict|who will win|analysis/i.test(lower)) {
+  // Mega odds patterns
+  if (/\d+\s*(?:m|million|k|x)?\s*(?:odds|ticket|bet)/i.test(lower) ||
+      /(?:give me|build|make|create|book me).*odds/i.test(lower)) {
+    await cmdMegaOdds(chatId, env, text);
+    return;
+  }
+
+  // Predictions — "predict X vs Y" or just "X vs Y"
+  if (/predict/i.test(lower)) {
+    const teamsMatch = text.match(/predict\s+(.+?)\s+(?:vs|versus|against)\s+(.+?)(?:$|[?.!])/i);
+    if (teamsMatch) {
+      await predictSpecificMatch(chatId, teamsMatch[1].trim(), teamsMatch[2].trim(), env);
+    } else {
+      await cmdEpl(chatId, env);
+    }
+    return;
+  }
+
+  // Value bets / EV
+  if (/(?:value|ev|edge|profitable|\+ev)/i.test(lower)) {
+    await cmdEv(chatId, env);
+    return;
+  }
+
+  // Games/fixtures
+  if (/(game|match|fixture)/i.test(lower)) {
     await cmdEpl(chatId, env);
-  } else {
-    await sendMessage(chatId,
-      `Tell me what you want and I'll price it.\n\nTry:\n<i>"give me 2m odds"</i>\n<i>"predict Arsenal vs Chelsea"</i>\n<i>"find me value bets"</i>
+    return;
+  }
 
-Or send a booking code and I'll convert it.`, env);
+  // Trim/shield
+  if (/trim/i.test(lower)) {
+    await cmdTrim(chatId, env, text);
+    return;
+  }
+  if (/shield|insur/i.test(lower)) {
+    await cmdShield(chatId, env, text);
+    return;
+  }
+
+  // Accumulator
+  if (/(?:acca|accumulator|parlay|multi)/i.test(lower)) {
+    await cmdAcca(chatId, env);
+    return;
+  }
+
+  // Bare SportyBet code (just pasted)
+  if (/^[A-Za-z0-9]{5,8}$/.test(text.trim())) {
+    await lookupBookingCode(chatId, text.trim().toUpperCase(), env);
+    return;
+  }
+
+  // Team vs team without "predict" keyword
+  const vsMatch = text.match(/^(.{2,30}?)\s+(?:vs|versus|v\.?)\s+(.{2,30}?)$/i);
+  if (vsMatch) {
+    await predictSpecificMatch(chatId, vsMatch[1].trim(), vsMatch[2].trim(), env);
+    return;
+  }
+
+  // Fallback
+  await sendMessage(chatId,
+    `I price games against the book.\n\nTry:\n<i>"give me 1m odds"</i>\n<i>"Arsenal vs Chelsea"</i>\n<i>"today games"</i>\n<i>"value bets"</i>`, env);
+}
+
+// Predict a specific match by team names
+async function predictSpecificMatch(chatId, homeTeam, awayTeam, env) {
+  try {
+    const model = await getFittedModel("epl");
+    
+    const findTeam = (input) => {
+      const inputLower = input.toLowerCase();
+      for (const name of Object.keys(model.teams)) {
+        const nameLower = name.toLowerCase();
+        if (nameLower.includes(inputLower) || inputLower.includes(nameLower.split(" ")[0])) {
+          return name;
+        }
+      }
+      return null;
+    };
+    
+    const home = findTeam(homeTeam);
+    const away = findTeam(awayTeam);
+
+    if (!home || !away) {
+      const available = Object.keys(model.teams).join(", ");
+      await sendMessage(chatId, 
+        `Couldn't match those teams. I cover:\n${available}`, env);
+      return;
+    }
+
+    const pred = await predictMatch(home, away);
+    let msg = `<b>${pred.homeTeam} vs ${pred.awayTeam}</b>\n\n`;
+    msg += `Home Win: <b>${(pred.homeWin * 100).toFixed(0)}%</b>\n`;
+    msg += `Draw: <b>${(pred.draw * 100).toFixed(0)}%</b>\n`;
+    msg += `Away Win: <b>${(pred.awayWin * 100).toFixed(0)}%</b>\n\n`;
+    msg += `xG: ${pred.xgHome}-${pred.xgAway} | BTTS: ${(pred.bttsYes * 100).toFixed(0)}% | O2.5: ${(pred.over25 * 100).toFixed(0)}%\n\n`;
+    msg += `<i>Dixon-Coles · ${pred.matchesUsed} matches fitted</i>`;
+    
+    await sendMessage(chatId, msg, env);
+  } catch (err) {
+    console.error("[overline] predict error:", err.message);
+    await sendMessage(chatId, `Error: ${err.message}`, env);
   }
 }
+
+// Look up a SportyBet booking code
+async function lookupBookingCode(chatId, code, env) {
+  try {
+    const resp = await fetch(
+      `https://www.sportybet.com/api/ng/orders/share/${encodeURIComponent(code)}`,
+      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } }
+    );
+    const data = await resp.json();
+
+    if (!data.isAvailable || data.bizCode !== 19001) {
+      await sendMessage(chatId, `Code <b>${code}</b> is invalid or expired.`, env);
+      return;
+    }
+
+    let msg = `<b>Ticket ${code}</b>\n\n`;
+    const ticket = data.data || {};
+    if (ticket.selections && ticket.selections.length > 0) {
+      msg += `${ticket.selections.length} selections:\n\n`;
+      let totalOdds = 1;
+      ticket.selections.forEach((sel, i) => {
+        totalOdds *= parseFloat(sel.odds) || 1;
+        msg += `${i + 1}. ${sel.matchName || sel.eventName || "?"}\n`;
+        msg += `   ${sel.marketName || ""} @ ${sel.odds || "?"}\n`;
+      });
+      msg += `\nTotal Odds: ${totalOdds.toFixed(2)}x`;
+    } else {
+      msg += JSON.stringify(ticket).slice(0, 500);
+    }
+
+    await sendMessage(chatId, msg, env);
+  } catch (err) {
+    await sendMessage(chatId, `Couldn't fetch that code.`, env);
+  }
+}
+
 
 // ─── Inline keyboard helper ────────────────────────────────────
 
