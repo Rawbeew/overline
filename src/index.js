@@ -141,7 +141,8 @@ async function handleUpdate(update, env) {
     } else if (text.startsWith("/shield")) {
       await cmdShield(chatId, env, text);
     } else if (text.startsWith("/racing")) {
-      await cmdRacing(chatId, env);
+      await sendMessage(chatId,
+        "Horse racing feed not connected yet.\nSame-race wins stay exclusive — never parlayed.\nI'll let you know when it's live.", env);
     } else if (/\d+\s*(?:m|million|k|x)\s*(?:odds|bet)/i.test(text) ||
                /(?:give me|build|make|create).*odds/i.test(text) ||
                /book me.*odds/i.test(text)) {
