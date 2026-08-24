@@ -2,7 +2,7 @@ name: Stake Odds Scraper
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,146 +12,17 @@ jobs:
   scrape-odds:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Install Puppeteer
-        run: npm install puppeteer
-
-      - name: Scrape Stake odds
+      - run: npm install puppeteer
+      - name: Scrape
+        run: node scraper.js
+      - name: Commit
         run: |
-          cat > scraper.js << 'EOF'
-          const puppeteer = require('puppeteer');
-          const fs = require('fs');
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--window-size=1920,1080',
-              ],
-            });
-
-            const page = await browser.newPage();
-            await page.setViewport({ width: 1920, height: 1080 });
-            await page.setUserAgent(
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            );
-
-            // Remove webdriver flag
-            await page.evaluateOnNewDocument(() => {
-              Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            });
-
-            console.log('Navigating to stake.com/sportsbook...');
-
-            try {
-              await page.goto('https://stake.com/sportsbook', {
-                waitUntil: 'networkidle2',
-                timeout: 30000,
-              });
-
-              // Wait for Cloudflare challenge to resolve (if present)
-              await new Promise(r => setTimeout(r, 8000));
-
-              // Check if we passed Cloudflare
-              const title = await page.title();
-              console.log('Page title:', title);
-
-              if (title.includes('Just a moment') || title.includes('challenge')) {
-                console.log('Cloudflare challenge detected, waiting longer...');
-                await new Promise(r => setTimeout(r, 15000));
-              }
-
-              // Try to extract sports events from the page
-              const odds = await page.evaluate(() => {
-                const events = [];
-
-                // Look for event cards / match rows in the DOM
-                // Stake's DOM structure — these selectors may need adjustment
-                const selectors = [
-                  '[data-testid="event-card"]',
-                  '.event-row',
-                  '.sports-event',
-                  '[class*="EventCard"]',
-                  '[class*="event"]',
-                ];
-
-                for (const selector of selectors) {
-                  const elements = document.querySelectorAll(selector);
-                  if (elements.length > 0) {
-                    elements.forEach(el => {
-                      try {
-                        const text = el.innerText || '';
-                        const lines = text.split('\n').filter(l => l.trim());
-
-                        if (lines.length >= 3) {
-                          events.push({
-                            raw_text: text.slice(0, 500),
-                            teams: lines.slice(0, 2),
-                            timestamp: new Date().toISOString(),
-                          });
-                        }
-                      } catch (e) { /* skip malformed elements */ }
-                    });
-
-                    if (events.length > 0) break; // found with this selector
-                  }
-                }
-
-                return events;
-              });
-
-              // If DOM scraping didn't work well, capture the full page text as fallback
-              let pageText = '';
-              if (odds.length === 0) {
-                pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 10000) || '');
-                console.log('DOM scraping empty. Page text captured:', pageText.length, 'chars');
-              }
-
-              const result = {
-                scrapedAt: new Date().toISOString(),
-                source: 'stake.com',
-                method: odds.length > 0 ? 'dom' : 'pagetext',
-                events: odds,
-                fallbackText: odds.length === 0 ? pageText : null,
-                pageTitle: title,
-              };
-
-              fs.writeFileSync('stake-odds.json', JSON.stringify(result, null, 2));
-              console.log(`Scraped ${odds.length} events. Saved to stake-odds.json`);
-
-            } catch (err) {
-              console.error('Scraping error:', err.message);
-              // Still write a file so the workflow doesn't fail silently
-              fs.writeFileSync('stake-odds.json', JSON.stringify({
-                error: err.message,
-                scrapedAt: new Date().toISOString(),
-                events: [],
-              }));
-            }
-
-            await browser.close();
-          })();
-          EOF
-
-          node scraper.js
-
-      - name: Commit results
-        run: |
-          git config user.name "overline-bot"
-          git config user.email "bot@overline.dev"
-          git add stake-odds.json
-          git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "odds update $(date -u +%Y-%m-%dT%H:%M)"
-          git push
+          git config user.name bot
+          git config user.email bot@overline.dev
+          git add stake-odds.json || true
+          git diff --cached --quiet || (git commit -m "odds update" && git push)
