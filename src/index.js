@@ -119,6 +119,7 @@ export default {
         // Handle slash commands
         if (text.startsWith("/")) {
           const cmd = text.split(" ")[0].toLowerCase();
+          let response = "";
           
           if (cmd === "/start") {
             response = "👋 Welcome to <b>Overline</b>.\n\nI predict football matches using stats.\n\nTry: \"correct scores\" or \"give me 50 odds\"\n\nYou get 2 free requests. Use /upgrade for unlimited.";
