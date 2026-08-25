@@ -8,6 +8,3 @@ BOT_USERNAME = "Onehundredandonebot"
 [[kv_namespaces]]
 binding = "FIXTURES"
 id = "f4a1cf24e5d94b5b806b06058d3ef780"
-
-[secrets]
-OVERLINE_BOT_TOKEN = "8862566723:AAFmBN9_8y2fIseREiSZxXQV-fo_2y5-Bes"
