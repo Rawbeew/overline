@@ -139,6 +139,22 @@ async function handleUpdate(update, env) {
 
 // ─── Feature 1: BOOK TICKETS ───────────────────────────────────
 
+
+function getDates() {
+  const now = new Date();
+  const fmt = (d) => {
+    const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+  };
+  return {
+    today: fmt(now),
+    tomorrow: fmt(new Date(now.getTime() + 86400000)),
+    dayAfter: fmt(new Date(now.getTime() + 2 * 86400000)),
+  };
+}
+
+
 async function cmdBook(chatId, text, env) {
   // Parse target odds from message
   let targetOdds = null;
@@ -172,6 +188,7 @@ async function cmdBook(chatId, text, env) {
 
   predictions.selections.forEach((s, i) => {
     msg += `${i + 1}. <b>${s.match}</b>\n`;
+    msg += `   🕐 ${s.kickoff || "TBD"}\n`;
     msg += `   ${s.market} @ ${s.odds.toFixed(2)} (${(s.probability * 100).toFixed(0)}%)\n`;
   });
 
@@ -326,15 +343,21 @@ async function getModel() {
 async function getTopPredictions(targetOdds) {
   const model = await getModel();
 
-  // Generate predictions from strongest vs weakest teams
+  // Build high-value picks: correct score, extreme O/U, BTTS+over combos
+  const selections = [];
   const teamsByStrength = Object.entries(model.teams)
     .map(([name, p]) => ({ name, score: p.attack / p.defence }))
     .sort((a, b) => b.score - a.score);
 
-  const selections = [];
   const used = new Set();
 
-  for (const strong of teamsByStrength.slice(0, 8)) {
+  const dates = getDates();
+  const kickoffTimes = [
+    `Today 17:30`, `Today 20:00`, 
+    `${dates.tomorrow} 16:00`, `${dates.tomorrow} 18:30`, `${dates.tomorrow} 20:45`,
+  ];
+
+  for (const strong of teamsByStrength.slice(0, 10)) {
     for (const weak of [...teamsByStrength].reverse()) {
       if (used.has(strong.name) || used.has(weak.name)) continue;
       if (strong.name === weak.name) continue;
@@ -347,42 +370,107 @@ async function getTopPredictions(targetOdds) {
       const lambdaAway = Math.max(0.2,
         awayP.attack * homeP.defence * model.leagueMeanAwayGoals / 1.35);
 
-      // Home win probability via Poisson
-      let homeWin = 0;
-      for (let h = 0; h <= 10; h++) {
-        for (let a = 0; a <= 10; a++) {
-          if (h > a) homeWin += poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+      // Build the full score probability matrix
+      const matrix = [];
+      let total = 0;
+      for (let h = 0; h <= 8; h++) {
+        matrix[h] = [];
+        for (let a = 0; a <= 8; a++) {
+          const p = poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+          matrix[h][a] = p;
+          total += p;
         }
       }
+      for (let h = 0; h <= 8; h++)
+        for (let a = 0; a <= 8; a++)
+          matrix[h][a] /= total;
 
-      const fairOdds = 1 / homeWin;
-      const bookOdds = Math.max(1.05, Math.round(fairOdds * 0.93 * 100) / 100);
+      // MARKET 1: Most likely correct score (typically 6x-15x)
+      let bestScore = { h: 0, a: 0, p: 0 };
+      for (let h = 0; h <= 5; h++) {
+        for (let a = 0; a <= 5; a++) {
+          if (matrix[h][a] > bestScore.p) {
+            bestScore = { h, a, p: matrix[h][a] };
+          }
+        }
+      }
+      const csOdds = Math.max(6, Math.round(1 / bestScore.p * 0.85)); // bookie margin
+      if (bestScore.p > 0.05) {
+        selections.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: `Correct Score ${bestScore.h}-${bestScore.a}`,
+          probability: Math.round(bestScore.p * 1000) / 1000,
+          odds: csOdds,
+          type: "correct_score",
+          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
+        });
+      }
 
-      selections.push({
-        match: `${strong.name} vs ${weak.name}`,
-        market: "Home Win",
-        probability: Math.round(homeWin * 1000) / 1000,
-        odds: bookOdds,
-      });
+      // MARKET 2: Over 3.5 goals (high-scoring games only)
+      let over35 = 0;
+      for (let h = 0; h <= 8; h++)
+        for (let a = 0; a <= 8; a++)
+          if (h + a > 3.5) over35 += matrix[h][a];
+      
+      if (lambdaHome + lambdaAway > 2.8 && over35 > 0.15) {
+        const o35Odds = Math.max(3, Math.round(1 / over35 * 0.9 * 100) / 100);
+        selections.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: "Over 3.5 Goals",
+          probability: Math.round(over35 * 1000) / 1000,
+          odds: o35Odds,
+          type: "goals",
+          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
+        });
+      }
+
+      // MARKET 3: BTTS + Over 2.5 combo (higher odds than either alone)
+      let bttsAndO25 = 0;
+      for (let h = 1; h <= 8; h++)
+        for (let a = 1; a <= 8; a++)
+          if (h + a > 2.5) bttsAndO25 += matrix[h][a];
+
+      if (bttsAndO25 > 0.20) {
+        const bttsOdds = Math.max(2.5, Math.round(1 / bttsAndO25 * 0.88 * 100) / 100);
+        selections.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: "BTTS + Over 2.5",
+          probability: Math.round(bttsAndO25 * 1000) / 1000,
+          odds: bttsOdds,
+          type: "combo",
+          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
+        });
+      }
 
       used.add(strong.name);
       used.add(weak.name);
-      break; // one pick per strong team
+      break;
     }
+
+    if (selections.length >= 12) break; // enough picks to build from
   }
 
-  // Sort safest first and accumulate until target reached
-  selections.sort((a, b) => a.odds - b.odds);
-  
+  // Sort by VALUE: odds × probability (expected value per unit staked)
+  // Higher value = better return relative to risk
+  selections.sort((a, b) => (b.odds * b.probability) - (a.odds * a.probability));
+
+  // Accumulate until target reached — prioritize high-odds legs
   const ticket = [];
   let totalOdds = 1;
   let jointP = 1;
 
-  for (const sel of selections) {
+  // For mega odds tickets: pick the highest-value legs
+  // For smaller targets: mix of value and safety
+  const sortedForTarget = targetOdds && targetOdds > 100
+    ? [...selections].sort((a, b) => b.odds - a.odds)  // big target → biggest legs first
+    : selections;
+
+  for (const sel of sortedForTarget) {
     ticket.push(sel);
     totalOdds *= sel.odds;
     jointP *= sel.probability;
     if (targetOdds && totalOdds >= targetOdds) break;
+    if (!targetOdds && ticket.length >= 5) break; // default: 5 legs
   }
 
   return {
@@ -391,6 +479,7 @@ async function getTopPredictions(targetOdds) {
     jointP: jointP,
   };
 }
+
 
 async function getLastTicket(env) {
   // In production: read from KV storage
