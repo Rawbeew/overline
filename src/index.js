@@ -71,16 +71,26 @@ export default {
 // ─── Message sender ────────────────────────────────────────────
 
 async function sendMsg(chatId, text, env) {
-  // Strip any characters that could break Telegram's HTML parser
-  const safe = text
-    .replace(/&(?!(amp|lt|gt|quot|#\d+);)/g, "&amp;")
-    .replace(/<(?!\/?(b|i|code|pre|u|s)>)/g, "&lt;");
+  // Try HTML first, fallback to plain text
+  const attempts = [
+    { text: text, parse_mode: "HTML" },
+    { text: text },  // no parse_mode = plain text
+  ];
 
-  await fetch(`https://api.telegram.org/bot${env.OVERLINE_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: String(chatId), text: safe, parse_mode: "HTML" }),
-  });
+  for (const body of attempts) {
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${env.OVERLINE_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: String(chatId), ...body }),
+      });
+      const result = await resp.json();
+      if (result.ok) return; // success!
+      console.error("[overline] send failed:", result.description);
+    } catch (e) {
+      console.error("[overline] send error:", e.message);
+    }
+  }
 }
 
 // ─── Response Generator ────────────────────────────────────────
