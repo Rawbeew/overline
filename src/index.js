@@ -5,6 +5,93 @@
 import { fetchLeagueData, parseCSV } from "./engines/live-data.js";
 import { fitDixonColes } from "./engines/dc-model.js";
 
+// ─── Access Control & Paywall ──────────────────────────────────
+
+const FREE_LIMIT = 2;  // total free requests ever
+
+async function getUserAccess(env, chatId) {
+  if (!env.FIXTURES) return { plan: "free", requests_used: 0, tokens: 0, expires: null };
+  
+  try {
+    const key = `user_${chatId}`;
+    const data = await env.FIXTURES.get(key, "json");
+    return data || { plan: "free", requests_used: 0, tokens: 0, expires: null };
+  } catch (e) {
+    return { plan: "free", requests_used: 0, tokens: 0, expires: null };
+  }
+}
+
+async function saveUserAccess(env, chatId, access) {
+  if (!env.FIXTURES) return;
+  try {
+    await env.FIXTURES.put(`user_${chatId}`, JSON.stringify(access));
+  } catch (e) { /* ignore */ }
+}
+
+async function checkAndIncrement(env, chatId) {
+  const access = await getUserAccess(env, chatId);
+  
+  if (access.plan === "premium" || access.plan === "lite") {
+    // Check expiry
+    if (access.expires && new Date(access.expires) < new Date()) {
+      access.plan = "free";
+      access.expires = null;
+    }
+    
+    // Premium with tokens
+    if (access.plan === "premium") {
+      if (access.tokens > 0) {
+        access.tokens -= 1;
+        await saveUserAccess(env, chatId, access);
+        return { allowed: true, access };
+      }
+      // Premium but no tokens — can still edit codes, no fresh research
+      return { allowed: true, access, noTokens: true };
+    }
+    
+    // Lite
+    const today = new Date().toISOString().split("T")[0];
+    if (access.last_request_date !== today) {
+      access.daily_count = 0;
+      access.last_request_date = today;
+    }
+    if ((access.daily_count || 0) < 15) {
+      access.daily_count = (access.daily_count || 0) + 1;
+      await saveUserAccess(env, chatId, access);
+      return { allowed: true, access };
+    }
+    return { allowed: false, access, reason: "daily_limit" };
+  }
+  
+  // Free tier
+  if (access.requests_used < FREE_LIMIT) {
+    access.requests_used += 1;
+    await saveUserAccess(env, chatId, access);
+    return { allowed: true, access, freeRemaining: FREE_LIMIT - access.requests_used };
+  }
+  
+  return { allowed: false, access, reason: "free_exhausted" };
+}
+
+function getUpgradeMessage() {
+  return `❌ <b>No Active Access</b>\n\n` +
+    `You've used your free requests. Upgrade to keep going.\n\n` +
+    
+    `💎 <b>Premium</b> — from ₦500\n` +
+    `• Fresh AI predictions\n` +
+    `• Correct scores & overs analysis\n` +
+    `• Auto-built tickets\n` +
+    `• Match research\n\n` +
+    
+    `⚡ <b>Lite</b> — from ₦200\n` +
+    `• 15 requests/day\n` +
+    `• Edit existing tickets\n` +
+    `• Split, trim, combine\n\n` +
+    
+    `Use /pricing to choose.`;
+}
+
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -29,13 +116,67 @@ export default {
           });
         } catch (e) { /* ignore */ }
 
+        // Handle slash commands
+        if (text.startsWith("/")) {
+          const cmd = text.split(" ")[0].toLowerCase();
+          
+          if (cmd === "/start") {
+            response = "👋 Welcome to <b>Overline</b>.\n\nI predict football matches using stats.\n\nTry: \"correct scores\" or \"give me 50 odds\"\n\nYou get 2 free requests. Use /upgrade for unlimited.";
+          }
+          else if (cmd === "/help") {
+            response = "How Overline works:\n\nI use a statistical model (Dixon-Coles) to predict match outcomes.\n\nAsk me for correct scores, overs, BTTS, or build a ticket.\n\nFree: 2 requests total\nPremium: unlimited predictions\nLite: 15 requests/day for code editing";
+          }
+          else if (cmd === "/upgrade") {
+            response = getUpgradeMessage();
+          }
+          else if (cmd === "/pricing") {
+            response = `💎 <b>Premium</b>\n• 1 Day — ₦500\n• 7 Days — ₦2,000\n• 30 Days — ₦5,000\n\n⚡ <b>Lite</b>\n• 1 Day — ₦200\n• 7 Days — ₦1,000\n• 30 Days — ₦3,500\n\n💎 Premium includes research tokens for fresh predictions.\n\nUse /upgrade to choose.`;
+          }
+          else if (cmd === "/benefits") {
+            response = `🆓 <b>Free</b>\n• 2 requests total\n• Basic predictions only\n\n💎 <b>Premium</b>\n• Fresh AI predictions\n• Correct scores & overs\n• Auto-built tickets\n• Booking codes\n• Match analysis\n\n⚡ <b>Lite</b>\n• 15 requests/day\n• Edit existing tickets\n• Split, trim, combine\n\nUse /upgrade to choose.`;
+          }
+          else if (cmd === "/subscription") {
+            const access = await getUserAccess(env, chatId);
+            if (access.plan === "free") {
+              response = `❌ <b>No Active Access</b>\n\nRequests used: ${access.requests_used}/${FREE_LIMIT}\n\nUse /upgrade to choose Lite or Premium.`;
+            } else {
+              const expiry = access.expires ? new Date(access.expires).toDateString() : "N/A";
+              response = `✅ <b>${access.plan.toUpperCase()}</b>\nExpires: ${expiry}\nTokens: ${access.tokens || 0}`;
+            }
+          }
+          else if (cmd === "/usage") {
+            const access = await getUserAccess(env, chatId);
+            response = `📊 <b>Usage</b>\nPlan: ${access.plan}\nRequests used: ${access.requests_used || 0}\nTokens remaining: ${access.tokens || 0}`;
+          }
+          else {
+            response = "Unknown command. Try /help";
+          }
+          
+          await sendMsg(chatId, response, env);
+          return new Response("OK");
+        }
+        
+        // Check paywall for non-command messages
+        const accessCheck = await checkAndIncrement(env, chatId);
+        
+        if (!accessCheck.allowed) {
+          response = getUpgradeMessage();
+          await sendMsg(chatId, response, env);
+          return new Response("OK");
+        }
+        
         // Generate response — wrapped so nothing crashes
         let response;
         try {
           response = await generateResponse(text, env);
+          
+          // Add remaining free requests note
+          if (accessCheck.freeRemaining !== undefined) {
+            response += `\n\n<i>${accessCheck.freeRemaining} free requests remaining. /upgrade for unlimited.</i>`;
+          }
         } catch (innerErr) {
           console.error("[overline] generate error:", innerErr.message);
-          response = "Hmm, hit a snag there. Try asking differently — like \"correct scores\" or \"overs 3.5\".";
+          response = "Hmm, hit a snag there. Try again.";
         }
 
         // Always try to send something
