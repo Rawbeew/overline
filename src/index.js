@@ -103,7 +103,7 @@ export default {
         chatId = update?.message?.chat?.id;
         const text = update?.message?.text || "";
 
-        if (!chatId || !text || text.startsWith("/")) {
+        if (!chatId || !text) {
           return new Response("OK");
         }
 
