@@ -1,7 +1,17 @@
 // engines/live-data.js — fetch real EPL fixtures + odds from football-data.co.uk
 // No API key needed. CSV downloads are free and open.
 
-const FOOTBALL_DATA_BASE = "https://www.football-data.co.uk/mmz4281/2425";
+// Auto-detect current season (e.g., "2627" for Aug 2026–May 2027)
+function getCurrentSeason() {
+  const now = new Date();
+  const year = now.getFullYear();
+  // Season runs Aug–May. If month >= Aug (7), we're in year/year+1
+  const startYear = now.getMonth() >= 7 ? year : year - 1;
+  const endYear = startYear + 1;
+  return `${String(startYear).slice(2)}${String(endYear).slice(2)}`;
+}
+
+const FOOTBALL_DATA_BASE = "https://www.football-data.co.uk/mmz4281";
 
 const LEAGUES = {
   epl:      { code: "E0", name: "Premier League" },
@@ -20,7 +30,8 @@ export async function fetchLeagueData(leagueKey) {
   const league = LEAGUES[leagueKey];
   if (!league) throw new Error(`Unknown league: ${leagueKey}`);
 
-  const url = `${FOOTBALL_DATA_BASE}/${league.code}.csv`;
+  const season = getCurrentSeason();
+  const url = `${FOOTBALL_DATA_BASE}/${season}/${league.code}.csv`;
   const resp = await fetch(url, {
     headers: { "User-Agent": "overline/0.1.0" },
   });
@@ -34,7 +45,7 @@ export async function fetchLeagueData(leagueKey) {
 /**
  * Parse football-data.co.uk CSV format
  */
-function parseCSV(csvText) {
+export function parseCSV(csvText) {
   const lines = csvText.split("\n").filter(l => l.trim());
   if (lines.length < 2) return [];
 

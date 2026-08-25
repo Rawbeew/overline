@@ -1,7 +1,7 @@
 // engines/dc-model.js — Dixon-Coles model fitted to full EPL season data
 // Fits attack/defence strength per team from football-data.co.uk results
 
-import { fetchLeagueData } from "./live-data.js";
+import { fetchLeagueData, parseCSV } from "./live-data.js";
 
 /**
  * Fit team attack/defence strengths from match history.
@@ -106,7 +106,26 @@ export async function getFittedModel(leagueKey = "epl") {
     return _cachedModel;
   }
 
-  const matches = await fetchLeagueData(leagueKey);
+  let matches = [];
+  
+  // Try current season first; if early in the season (<50 matches),
+  // also fetch previous season so the model has enough data to fit
+  try {
+    matches = await fetchLeagueData(leagueKey);
+  } catch (e) {
+    console.error("Current season fetch failed:", e.message);
+  }
+
+  if (matches.length < 50) {
+    // Prepend previous season data for a better fit
+    try {
+      const prevMatches = await fetchPreviousSeason(leagueKey);
+      matches = [...prevMatches, ...matches];
+    } catch (e) {
+      console.error("Previous season fetch failed:", e.message);
+    }
+  }
+
   const model = fitDixonColes(matches);
   model.matches = matches; // keep raw data for reference
   _cachedModel = model;
@@ -261,4 +280,26 @@ export async function buildMegaTicket(targetOdds, leagueKey = "epl") {
     selections: ticket,
     legs: ticket.length,
   };
+}
+
+// Fetch previous season's data for model fitting
+async function fetchPreviousSeason(leagueKey) {
+  const { LEAGUES } = await import("./live-data.js");
+  const now = new Date();
+  const year = now.getFullYear();
+  const startYear = now.getMonth() >= 7 ? year : year - 1;
+  const prevStart = startYear - 1;
+  const prevEnd = startYear;
+  const prevSeason = `${String(prevStart).slice(2)}${String(prevEnd).slice(2)}`;
+  
+  const league = LEAGUES[leagueKey];
+  const url = `https://www.football-data.co.uk/mmz4281/${prevSeason}/${league.code}.csv`;
+  
+  const resp = await fetch(url, {
+    headers: { "User-Agent": "overline/0.1.0" },
+  });
+  if (!resp.ok) throw new Error(`Failed: ${resp.status}`);
+  
+  const csv = await resp.text();
+  return parseCSV(csv);
 }

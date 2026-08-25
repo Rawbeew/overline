@@ -1,60 +1,30 @@
-// index.js — Overline Telegram bot
-// Telegram-first sports pricing bot. Model P versus the book.
-// Engines own all probabilities. LLM routes intent only.
+// index.js — Overline v2
+// Telegram-first sports prediction bot. Football + Basketball.
+// Three features: Book, Split, Optimize. One metric: win rate.
+// SportyBet for booking.
 
-import { dixonColes, accumulatorProbability } from "./engines/dixon-coles.js";
-import { shinImplied, naiveImplied } from "./engines/shin.js";
-import { trimToTarget, splitTicket, shield } from "./engines/trim-shield.js";
-import { fetchLeagueData, getTeams } from "./engines/live-data.js";
-import { getFittedModel, predictMatch, buildMegaTicket } from "./engines/dc-model.js";
+import { fetchLeagueData, parseCSV } from "./engines/live-data.js";
+import { fitDixonColes } from "./engines/dc-model.js";
 
-// ─── Stake odds via GitHub Actions output ─────────────────────
-
-async function getStakeOdds() {
-  // Read from the repo's committed JSON (updated by GitHub Actions every 30 min)
-  const resp = await fetch(
-    "https://raw.githubusercontent.com/Rawbeew/overline/master/stake-odds.json",
-    { headers: { "User-Agent": "overline/0.1.0" } }
-  );
-  if (!resp.ok) return null;
-  return await resp.json();
-}
-
+// ─── Worker entry ──────────────────────────────────────────────
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    console.log(`[overline] ${request.method} ${url.pathname}`);
-
     if (url.pathname === "/api/telegram" && request.method === "POST") {
       try {
         const update = await request.json();
-        console.log("[overline] update received:", JSON.stringify(update).slice(0, 500));
-        
-        if (!env.OVERLINE_BOT_TOKEN) {
-          console.error("[overline] OVERLINE_BOT_TOKEN is undefined!");
-          return new Response("TOKEN MISSING", { status: 500 });
-        }
-        
         await handleUpdate(update, env);
         return new Response("OK");
       } catch (err) {
-        console.error("[overline] handler error:", err.message, err.stack);
-        return new Response(`Error: ${err.message}`, { status: 500 });
+        console.error("[overline] error:", err.message);
+        return new Response("OK"); // always 200 to Telegram
       }
     }
 
-    if (url.pathname === "/debug") {
-      return Response.json({
-        hasToken: !!env.OVERLINE_BOT_TOKEN,
-        tokenPrefix: env.OVERLINE_BOT_TOKEN ? env.OVERLINE_BOT_TOKEN.slice(0, 10) : "NONE",
-        pathname: url.pathname,
-      });
-    }
-
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, bot: "overline", version: "0.1.1" });
+      return Response.json({ ok: true, version: "2.0" });
     }
 
     return new Response("Overline — model P vs the book.", { status: 200 });
@@ -68,37 +38,24 @@ async function sendMessage(chatId, text, env, replyMarkup = null) {
   const body = { chat_id: String(chatId), text: text, parse_mode: "HTML" };
   if (replyMarkup) body.reply_markup = replyMarkup;
 
-  const payload = JSON.stringify(body);
-  
   try {
     const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
-      headers: { 
-        "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": "overline/0.1.0"
-      },
-      body: new TextEncoder().encode(payload),
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: new TextEncoder().encode(JSON.stringify(body)),
     });
-    
     const result = await resp.json();
     if (!result.ok) {
-      console.error("[overline] sendMessage failed:", JSON.stringify(result));
-      // Retry without HTML parse mode in case of encoding issues
-      if (result.error_code === 400) {
-        delete body.parse_mode;
-        const retryResp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json; charset=utf-8" },
-          body: new TextEncoder().encode(JSON.stringify(body)),
-        });
-        const retryResult = await retryResp.json();
-        console.log("[overline] retry result:", retryResult.ok);
-      }
+      // Retry without HTML in case of encoding issues
+      delete body.parse_mode;
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: new TextEncoder().encode(JSON.stringify(body)),
+      });
     }
-    return result;
   } catch (err) {
     console.error("[overline] sendMessage error:", err.message);
-    throw err;
   }
 }
 
@@ -110,497 +67,8 @@ async function sendTyping(chatId, env) {
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: new TextEncoder().encode(JSON.stringify({ chat_id: String(chatId), action: "typing" })),
     });
-  } catch (err) {
-    console.error("[overline] typing error:", err.message);
-  }
+  } catch (err) { /* non-critical */ }
 }
-
-// ─── Update router ─────────────────────────────────────────────
-
-async function handleUpdate(update, env) {
-  if (!update.message) return;
-  const chatId = update.message.chat.id;
-  const text = update.message.text || "";
-  const lower = text.toLowerCase();
-
-  try {
-    await sendTyping(chatId, env);
-    
-    if (text.startsWith("/start")) {
-      await cmdStart(chatId, env);
-    } else if (text.startsWith("/acca")) {
-      await cmdAcca(chatId, env);
-    } else if (text.startsWith("/epl")) {
-      await cmdEpl(chatId, env);
-    } else if (text.startsWith("/npfl")) {
-      await cmdNpfl(chatId, env);
-    } else if (text.startsWith("/ev")) {
-      await cmdEv(chatId, env);
-    } else if (text.startsWith("/trim")) {
-      await cmdTrim(chatId, env, text);
-    } else if (text.startsWith("/shield")) {
-      await cmdShield(chatId, env, text);
-    } else if (text.startsWith("/racing")) {
-      await sendMessage(chatId,
-        "Horse racing feed not connected yet.\nSame-race wins stay exclusive — never parlayed.\nI'll let you know when it's live.", env);
-    } else if (/\d+\s*(?:m|million|k|x)\s*(?:odds|bet)/i.test(text) ||
-               /(?:give me|build|make|create).*odds/i.test(text) ||
-               /book me.*odds/i.test(text)) {
-      await cmdMegaOdds(chatId, env, text);
-    } else if (/(?:predict|analysis|who will win)/i.test(lower)) {
-      await cmdEpl(chatId, env);
-    } else {
-      // Try natural language routing via LLM
-      await routeNaturalLanguage(chatId, text, env);
-    }
-  } catch (err) {
-    console.error("Error:", err);
-    await sendMessage(chatId, `Error: ${err.message}`, env);
-  }
-}
-
-// ─── Commands ──────────────────────────────────────────────────
-
-
-// ─── Date helpers ──────────────────────────────────────────────
-
-function getDates() {
-  const now = new Date();
-  const fmt = (d) => {
-    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
-  };
-  return {
-    today: fmt(now),
-    tomorrow: fmt(new Date(now.getTime() + 86400000)),
-    weekend: (() => {
-      // next Saturday
-      const sat = new Date(now);
-      sat.setDate(now.getDate() + (6 - now.getDay()) % 7 || 7);
-      return fmt(sat);
-    })(),
-    dayAfter: fmt(new Date(now.getTime() + 2 * 86400000)),
-  };
-}
-
-
-async function cmdStart(chatId, env) {
-  await sendMessage(
-    chatId,
-    `<b>Overline</b> — model P versus the book.\n\n` +
-    `Not a casino. Not a tipster. A pricing desk.\n\n` +
-    `Commands:\n` +
-    `/acca — build an accumulator\n` +
-    `/epl — Premier League + predictions\n` +
-    `/npfl — Nigerian Pro League\n` +
-    `/ev — find +EV bets\n` +
-    `/setka — table tennis\n` +
-    `/racing — horse racing\n` +
-    `/trim — trim a ticket to target odds\n` +
-    `/shield — insurance for 3+ leg tickets\n\n` +
-    `Or just say <i>"give me 1m odds"</i>\n\n` +
-    ``,
-    env,
-    inlineKeys([
-      ["EPL Predictions", "/epl"],
-      ["Find +EV", "/ev"],
-      ["1m Odds", "give me 1000000 odds"],
-      ["Shield Test", "/shield"],
-    ])
-  );
-}
-
-async function cmdAcca(chatId, env) {
-  // Demo accumulator with Dixon-Coles predictions
-  const selections = [
-    { label: "Arsenal vs Chelsea — Home Win", model_p: 0.675, odds: 1.65, sameLeague: true },
-    { label: "Man City vs Everton — Home Win", model_p: 0.82, odds: 1.25, sameLeague: true },
-    { label: "Liverpool vs Spurs — Home Win", model_p: 0.71, odds: 1.45, sameLeague: true },
-  ];
-
-  const { jointP, naiveJointP } = accumulatorProbability(selections);
-  const totalOdds = selections.reduce((a, s) => a * s.odds, 1);
-
-  const dates = getDates();
-  let msg = `<b>Accumulator</b>
-📅 Games: ${dates.today} → ${dates.tomorrow}
-<i>Live data: football-data.co.uk</i>
-
-`;
-  selections.forEach((s, i) => {
-    msg += `${i + 1}. ${s.label}\n`;
-    msg += `   model_p: ${(s.model_p * 100).toFixed(1)}% @ ${s.odds.toFixed(2)}\n`;
-    msg += `   EV: ${((s.model_p * s.odds - 1) * 100).toFixed(1)}%\n\n`;
-  });
-
-  msg += `<b>Total Odds:</b> ${totalOdds.toFixed(2)}x\n`;
-  msg += `<b>Joint P (haircut):</b> ${(jointP * 100).toFixed(1)}%\n`;
-  msg += `<b>Naive Joint P:</b> ${(naiveJointP * 100).toFixed(1)}%\n`;
-  
-
-  await sendMessage(chatId, msg, env, inlineKeys([["Trim to 20x", "/trim 20"], ["Shield", "/shield"]]));
-}
-
-async function cmdEpl(chatId, env) {
-  try {
-    const matches = await fetchLeagueData("epl");
-    if (!matches || matches.length === 0) {
-      await sendMessage(chatId, "No EPL data available right now.", env);
-      return;
-    }
-
-    // Get recent matches with results
-    const recent = matches.slice(-10);
-    const dates = getDates();
-    
-    let msg = `<b>Premier League — Real Data</b>\n`;
-    msg += `📅 Season 2024-25 · ${matches.length} total matches\n`;
-    msg += `<i>Latest results:</i>\n\n`;
-
-    // Show last 5 results
-    for (const m of recent) {
-      const resultIcon = m.result === "H" ? "🏠" : m.result === "A" ? "✈️" : "🤝";
-      msg += `${resultIcon} <b>${m.homeTeam} ${m.homeGoals}-${m.awayGoals} ${m.awayTeam}</b>\n`;
-      msg += `   ${m.date} | Odds: H=${m.odds.bet365.home} D=${m.odds.bet365.draw} A=${m.odds.bet365.away}\n\n`;
-    }
-
-    // Fit Dixon-Coles and predict next fixture
-    const teams = [...new Set(matches.flatMap(m => [m.homeTeam, m.awayTeam]))];
-    if (teams.length >= 2 && recent.length >= 10) {
-      const goalsHome = recent.map(m => m.homeGoals);
-      const goalsAway = recent.map(m => m.awayGoals);
-      const teamsHome = recent.map(m => m.homeTeam);
-      const teamsAway = recent.map(m => m.awayTeam);
-
-      msg += `<b>Dixon-Coles Model (last 10):</b>\n`;
-      
-      // Predict a sample match
-      if (recent.length >= 2) {
-        const nextHome = recent[0].awayTeam; // swap for variety
-        const nextAway = recent[1].homeTeam;
-        
-        try {
-          const { dixonColes } = await import("./engines/dixon-coles.js");
-          const pred = dixonColes(1.3, 0.9, 1.0, 1.1); // will be replaced with fitted params
-          msg += `Next: ${nextHome} vs ${nextAway}\n`;
-          msg += `  Home: ${(pred.homeWin * 100).toFixed(0)}% | `;
-          msg += `Draw: ${(pred.draw * 100).toFixed(0)}% | `;
-          msg += `Away: ${(pred.awayWin * 100).toFixed(0)}%\n`;
-        } catch (e) {
-          msg += `Prediction engine warming up...\n`;
-        }
-      }
-    }
-
-    msg += `\n<i>Data: football-data.co.uk</i>`;
-    await sendMessage(chatId, msg, env);
-
-  } catch (err) {
-    console.error("[overline] cmdEpl error:", err.message);
-    await sendMessage(chatId, `Error fetching EPL data: ${err.message}`, env);
-  }
-}
-
-
-async function cmdEv(chatId, env) {
-  // Compare model_p vs Shin-implied book_p
-  const bets = [
-    { match: "Arsenal vs Chelsea", market: "Home", modelP: 0.675, odds: 1.65 },
-    { match: "Man City vs Everton", market: "Home", modelP: 0.82, odds: 1.25 },
-    { match: "Liverpool vs Spurs", market: "Home", modelP: 0.71, odds: 1.45 },
-    { match: "Brighton vs Villa", market: "BTTS Yes", modelP: 0.58, odds: 1.80 },
-  ];
-
-  const dates = getDates();
-  let msg = `<b>+EV Scanner</b>\n📅 ${dates.today} & ${dates.tomorrow}\n<i>Model P vs Shin-implied book P</i>
-
-`;
-  let foundEv = false;
-
-  for (const bet of bets) {
-    const implied = shinImplied([bet.odds, 3.5]); // simplified — need full odds array
-    const ev = bet.modelP * bet.odds - 1;
-    const flag = ev > 0 ? "+EV" : "-EV";
-    if (ev > 0) foundEv = true;
-
-    msg += `${bet.match}\n`;
-    msg += `  ${bet.market}: model=${(bet.modelP * 100).toFixed(0)}% @ ${bet.odds}\n`;
-    msg += `  EV: ${flag} (${(ev * 100).toFixed(1)}%)\n\n`;
-  }
-
-  if (!foundEv) msg += `<i>No +EV found in live data.</i>\n`;
-
-  await sendMessage(chatId, msg, env);
-}
-
-async function cmdNpfl(chatId, env) {
-  await sendMessage(
-    chatId,
-    "<b>Nigerian Pro League</b>\n\nNPFL data source not wired.\nThe catalogue includes NPFL but live fixtures require the soccerdata pipeline.\n\n",
-    env
-  );
-}
-
-async function cmdRacing(chatId, env) {
-  await sendMessage(
-    chatId,
-    "<b>Horse Racing — Benter-lite</b>\n\nConditional logit model not yet fitted to live data.\nSame-race wins are exclusive — never parlayed.\n\n<i>Awaiting racing feed.</i>",
-    env
-  );
-}
-
-async function cmdSetka(chatId, env) {
-  await sendMessage(
-    chatId,
-    "<b>Table Tennis — Setka TT</b>\n\nPairwise point-logistic model.\nNo serious public dataset available.\nKeeping frame binomial until we have our own scrape.\n\n<i>Awaiting data source.</i>",
-    env
-  );
-}
-
-async function cmdTrim(chatId, env, text) {
-  const targetMatch = text.match(/\/trim\s+(\d+)/);
-  const target = targetMatch ? parseInt(targetMatch[1]) : 20;
-
-  const selections = [
-    { label: "Arsenal Home @1.65", model_p: 0.675, odds: 1.65 },
-    { label: "Man City Home @1.25", model_p: 0.82, odds: 1.25 },
-    { label: "Liverpool Home @1.45", model_p: 0.71, odds: 1.45 },
-    { label: "Wolves Away @2.80", model_p: 0.38, odds: 2.80 },
-    { label: "Newcastle Draw @3.50", model_p: 0.31, odds: 3.50 },
-    { label: "Brighton BTTS @1.80", model_p: 0.58, odds: 1.80 },
-  ];
-
-  const result = trimToTarget(selections, target);
-
-  let msg = `<b>Trimmed to ${result.newTotalOdds}x</b>\n\n`;
-  msg += `<b>Kept (${result.kept.length}):</b>\n`;
-  result.kept.forEach((k, i) => {
-    msg += `  ${i + 1}. ${k.label} — p=${(k.model_p * 100).toFixed(0)}%\n`;
-  });
-  msg += `\n<b>Removed (${result.removed.length}):</b>\n`;
-  result.removed.forEach((r) => {
-    msg += `  ✗ ${r.label} — p=${(r.model_p * 100).toFixed(0)}%\n`;
-  });
-  msg += `\n<b>New Joint P:</b> ${(result.jointP * 100).toFixed(1)}%\n`;
-
-  await sendMessage(chatId, msg, env);
-}
-
-async function cmdShield(chatId, env, text) {
-  const selections = [
-    { label: "Arsenal Home @1.65", model_p: 0.675, odds: 1.65 },
-    { label: "Man City Home @1.25", model_p: 0.82, odds: 1.25 },
-    { label: "Liverpool Home @1.45", model_p: 0.71, odds: 1.45 },
-  ];
-
-  const stake = 100;
-  const result = shield(selections, stake);
-
-  let msg = `<b>Shield Analysis — ${result.legs} legs @ ₦${stake}</b>\n`;
-  msg += `Total Odds: ${result.totalOdds}x\n\n`;
-  
-  for (const [scenario, data] of Object.entries(result.scenarios)) {
-    msg += `  ${scenario.replace("_", " ")}: ₦${data.payout}\n`;
-  }
-  msg += `\n<i>If one leg misses, the best sub-parlay still pays.</i>`;
-
-  await sendMessage(chatId, msg, env);
-}
-
-async function cmdMegaOdds(chatId, env, text) {
-  let target = 1000000;
-
-  const millionMatch = text.match(/(\d+)\s*m(?:illion)?/i);
-  const numberMatch = text.match(/(\d{3,})\s*(?:odds|x)/i);
-
-  if (millionMatch) target = parseInt(millionMatch[1]) * 1000000;
-  else if (numberMatch) target = parseInt(numberMatch[1]);
-
-  try {
-    const ticket = await buildMegaTicket(target);
-    
-    if (ticket.error) {
-      await sendMessage(chatId, `Error: ${ticket.error}`, env);
-      return;
-    }
-
-    const dates = getDates();
-    let msg = `<b>Mega Ticket Builder</b>\n`;
-    msg += `Target: ${target.toLocaleString()}x\n`;
-    msg += `📅 ${dates.today} → ${dates.weekend}\n`;
-    msg += `Model: Dixon-Coles (fitted on ${ticket.matchesFitted || "full season"})\n\n`;
-
-    ticket.selections.forEach((s2, i) => {
-      msg += `${i + 1}. [${kickoffs[i % kickoffs.length]}] ${s2.label}\n`;
-      msg += `   conf: ${(s2.model_p * 100).toFixed(0)}% @ ${s2.odds.toFixed(2)}\n`;
-    });
-
-    msg += `\n<b>Total Odds:</b> ${ticket.achievedOdds.toLocaleString()}x\n`;
-    msg += `<b>Est. Probability:</b> ${(ticket.jointProbability * 100).toExponential(2)}%\n`;
-    msg += `<b>Legs:</b> ${ticket.legs}\n`;
-
-    if (ticket.jointProbability < 0.001) {
-      msg += `\n⚠️ Lottery territory. Try <code>trim to 50</code> for realistic odds.`;
-    }
-
-    await sendMessage(chatId, msg, env, inlineKeys([
-      ["Trim to 50x", "trim to 50"],
-      ["Trim to 1000x", "trim to 1000"],
-      ["Split into 3", "split into 3"],
-    ]));
-  } catch (err) {
-    console.error("[overline] mega odds error:", err.message);
-    await sendMessage(chatId, `Error building ticket: ${err.message}`, env);
-  }
-}
-
-
-async function routeNaturalLanguage(chatId, text, env) {
-  const lower = text.toLowerCase().trim();
-
-  // Mega odds patterns
-  if (/\d+\s*(?:m|million|k|x)?\s*(?:odds|ticket|bet)/i.test(lower) ||
-      /(?:give me|build|make|create|book me).*odds/i.test(lower)) {
-    await cmdMegaOdds(chatId, env, text);
-    return;
-  }
-
-  // Predictions — "predict X vs Y" or just "X vs Y"
-  if (/predict/i.test(lower)) {
-    const teamsMatch = text.match(/predict\s+(.+?)\s+(?:vs|versus|against)\s+(.+?)(?:$|[?.!])/i);
-    if (teamsMatch) {
-      await predictSpecificMatch(chatId, teamsMatch[1].trim(), teamsMatch[2].trim(), env);
-    } else {
-      await cmdEpl(chatId, env);
-    }
-    return;
-  }
-
-  // Value bets / EV
-  if (/(?:value|ev|edge|profitable|\+ev)/i.test(lower)) {
-    await cmdEv(chatId, env);
-    return;
-  }
-
-  // Games/fixtures
-  if (/(game|match|fixture)/i.test(lower)) {
-    await cmdEpl(chatId, env);
-    return;
-  }
-
-  // Trim/shield
-  if (/trim/i.test(lower)) {
-    await cmdTrim(chatId, env, text);
-    return;
-  }
-  if (/shield|insur/i.test(lower)) {
-    await cmdShield(chatId, env, text);
-    return;
-  }
-
-  // Accumulator
-  if (/(?:acca|accumulator|parlay|multi)/i.test(lower)) {
-    await cmdAcca(chatId, env);
-    return;
-  }
-
-  // Bare SportyBet code (just pasted)
-  if (/^[A-Za-z0-9]{5,8}$/.test(text.trim())) {
-    await lookupBookingCode(chatId, text.trim().toUpperCase(), env);
-    return;
-  }
-
-  // Team vs team without "predict" keyword
-  const vsMatch = text.match(/^(.{2,30}?)\s+(?:vs|versus|v\.?)\s+(.{2,30}?)$/i);
-  if (vsMatch) {
-    await predictSpecificMatch(chatId, vsMatch[1].trim(), vsMatch[2].trim(), env);
-    return;
-  }
-
-  // Fallback
-  await sendMessage(chatId,
-    `I price games against the book.\n\nTry:\n<i>"give me 1m odds"</i>\n<i>"Arsenal vs Chelsea"</i>\n<i>"today games"</i>\n<i>"value bets"</i>`, env);
-}
-
-// Predict a specific match by team names
-async function predictSpecificMatch(chatId, homeTeam, awayTeam, env) {
-  try {
-    const model = await getFittedModel("epl");
-    
-    const findTeam = (input) => {
-      const inputLower = input.toLowerCase();
-      for (const name of Object.keys(model.teams)) {
-        const nameLower = name.toLowerCase();
-        if (nameLower.includes(inputLower) || inputLower.includes(nameLower.split(" ")[0])) {
-          return name;
-        }
-      }
-      return null;
-    };
-    
-    const home = findTeam(homeTeam);
-    const away = findTeam(awayTeam);
-
-    if (!home || !away) {
-      const available = Object.keys(model.teams).join(", ");
-      await sendMessage(chatId, 
-        `Couldn't match those teams. I cover:\n${available}`, env);
-      return;
-    }
-
-    const pred = await predictMatch(home, away);
-    let msg = `<b>${pred.homeTeam} vs ${pred.awayTeam}</b>\n\n`;
-    msg += `Home Win: <b>${(pred.homeWin * 100).toFixed(0)}%</b>\n`;
-    msg += `Draw: <b>${(pred.draw * 100).toFixed(0)}%</b>\n`;
-    msg += `Away Win: <b>${(pred.awayWin * 100).toFixed(0)}%</b>\n\n`;
-    msg += `xG: ${pred.xgHome}-${pred.xgAway} | BTTS: ${(pred.bttsYes * 100).toFixed(0)}% | O2.5: ${(pred.over25 * 100).toFixed(0)}%\n\n`;
-    msg += `<i>Dixon-Coles · ${pred.matchesUsed} matches fitted</i>`;
-    
-    await sendMessage(chatId, msg, env);
-  } catch (err) {
-    console.error("[overline] predict error:", err.message);
-    await sendMessage(chatId, `Error: ${err.message}`, env);
-  }
-}
-
-// Look up a SportyBet booking code
-async function lookupBookingCode(chatId, code, env) {
-  try {
-    const resp = await fetch(
-      `https://www.sportybet.com/api/ng/orders/share/${encodeURIComponent(code)}`,
-      { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } }
-    );
-    const data = await resp.json();
-
-    if (!data.isAvailable || data.bizCode !== 19001) {
-      await sendMessage(chatId, `Code <b>${code}</b> is invalid or expired.`, env);
-      return;
-    }
-
-    let msg = `<b>Ticket ${code}</b>\n\n`;
-    const ticket = data.data || {};
-    if (ticket.selections && ticket.selections.length > 0) {
-      msg += `${ticket.selections.length} selections:\n\n`;
-      let totalOdds = 1;
-      ticket.selections.forEach((sel, i) => {
-        totalOdds *= parseFloat(sel.odds) || 1;
-        msg += `${i + 1}. ${sel.matchName || sel.eventName || "?"}\n`;
-        msg += `   ${sel.marketName || ""} @ ${sel.odds || "?"}\n`;
-      });
-      msg += `\nTotal Odds: ${totalOdds.toFixed(2)}x`;
-    } else {
-      msg += JSON.stringify(ticket).slice(0, 500);
-    }
-
-    await sendMessage(chatId, msg, env);
-  } catch (err) {
-    await sendMessage(chatId, `Couldn't fetch that code.`, env);
-  }
-}
-
-
-// ─── Inline keyboard helper ────────────────────────────────────
 
 function inlineKeys(rows) {
   return {
@@ -608,4 +76,393 @@ function inlineKeys(rows) {
       { text, callback_data: callback_data || text },
     ]),
   };
+}
+
+// ─── Update router ─────────────────────────────────────────────
+
+async function handleUpdate(update, env) {
+  if (!update.message) return;
+  const chatId = update.message.chat.id;
+  const text = (update.message.text || "").trim();
+  const lower = text.toLowerCase();
+
+  if (!text || text.startsWith("/")) return; // ignore commands and empty
+
+  await sendTyping(chatId, env);
+
+  try {
+    // OPTIMIZE — "optimize", "trim", "trim to 50x"
+    if (/^(?:optimize|optimise|trim)/i.test(lower)) {
+      await cmdOptimize(chatId, text, env);
+      return;
+    }
+
+    // SPLIT — "split into 3", "split"
+    if (/^split/i.test(lower)) {
+      await cmdSplit(chatId, text, env);
+      return;
+    }
+
+    // WIN RATE — "win rate", "stats", "how accurate"
+    if (/win.?rate|accuracy|how good|stats/i.test(lower)) {
+      await cmdWinRate(chatId, env);
+      return;
+    }
+
+    // MEGA/BIG ODDS — "give me X odds", "book me odds"
+    if (/(?:odds|ticket|bet|book)/i.test(lower) && /(?:give|build|make|create|book|get|\d)/i.test(lower)) {
+      await cmdBook(chatId, text, env);
+      return;
+    }
+
+    // TEAM vs TEAM — "Arsenal vs Chelsea"
+    const vsMatch = text.match(/^(.{2,30}?)\s+(?:vs|versus|v\.?)\s+(.{2,30}?)$/i);
+    if (vsMatch) {
+      await cmdPredictMatch(chatId, vsMatch[1].trim(), vsMatch[2].trim(), env);
+      return;
+    }
+
+    // Default — show what the bot does
+    await sendMessage(chatId,
+      `I predict games and build tickets.\n\n` +
+      `<i>"give me odds"</i> — today's best picks\n` +
+      `<i>"Arsenal vs Chelsea"</i> — match prediction\n` +
+      `<i>"trim to 50x"</i> — optimize a ticket\n` +
+      `<i>"split into 3"</i> — split into smaller bets\n` +
+      `<i>"win rate"</i> — model accuracy\n`, env);
+
+  } catch (err) {
+    console.error("[overline] handler:", err.message);
+    await sendMessage(chatId, `Something went wrong. Try again.`, env);
+  }
+}
+
+// ─── Feature 1: BOOK TICKETS ───────────────────────────────────
+
+async function cmdBook(chatId, text, env) {
+  // Parse target odds from message
+  let targetOdds = null;
+  const mMatch = text.match(/(\d+)\s*m(?:illion)?/i);
+  const kMatch = text.match(/(\d+)\s*k\b/i);
+  const xMatch = text.match(/(\d+)\s*x\b/i);
+  const plainMatch = text.match(/\b(\d{2,7})\b/);
+
+  if (mMatch) targetOdds = parseInt(mMatch[1]) * 1000000;
+  else if (kMatch) targetOdds = parseInt(kMatch[1]) * 1000;
+  else if (xMatch) targetOdds = parseInt(xMatch[1]);
+  else if (plainMatch) targetOdds = parseInt(plainMatch[1]);
+
+  await sendMessage(chatId, `Building ticket...`, env);
+  const predictions = await getTopPredictions(targetOdds);
+
+  if (!predictions.selections.length) {
+    await sendMessage(chatId, `No confident picks available right now. Check back later.`, env);
+    return;
+  }
+
+  const winRate = await getWinRate();
+  let msg = `<b>Ticket</b>\n`;
+  msg += `Total odds: <b>${predictions.totalOdds.toLocaleString()}x</b>\n`;
+  msg += `Win probability: <b>${(predictions.jointP * 100).toFixed(1)}%</b>\n`;
+  msg += `Legs: ${predictions.selections.length}\n`;
+  if (winRate.count > 0) {
+    msg += `Model win rate: <b>${winRate.pct}%</b> (${winRate.count} predictions)\n`;
+  }
+  msg += `\n`;
+
+  predictions.selections.forEach((s, i) => {
+    msg += `${i + 1}. <b>${s.match}</b>\n`;
+    msg += `   ${s.market} @ ${s.odds.toFixed(2)} (${(s.probability * 100).toFixed(0)}%)\n`;
+  });
+
+  msg += `\n<i>Add these to your SportyBet slip.</i>`;
+
+  await sendMessage(chatId, msg, env, inlineKeys([
+    [`Optimize to 50x`, `optimize to 50`],
+    [`Split into 3`, `split into 3`],
+    [`Win rate`, `win rate`],
+  ]));
+}
+
+// ─── Feature 2: SPLIT ──────────────────────────────────────────
+
+async function cmdSplit(chatId, text, env) {
+  const partsMatch = text.match(/(\d+)/);
+  const parts = partsMatch ? Math.min(parseInt(partsMatch[1]), 10) : 3;
+
+  // Get the last built ticket from KV or rebuild
+  const ticket = await getLastTicket(env);
+  if (!ticket || !ticket.length) {
+    await sendMessage(chatId, `No ticket to split. Say <i>"give me odds"</i> first.`, env);
+    return;
+  }
+
+  const perPart = Math.ceil(ticket.length / parts);
+  let msg = `<b>Split into ${parts} tickets</b>\n\n`;
+
+  for (let i = 0; i < parts; i++) {
+    const chunk = ticket.slice(i * perPart, (i + 1) * perPart);
+    if (!chunk.length) break;
+
+    let subOdds = 1;
+    let subProb = 1;
+    msg += `<b>Ticket ${i + 1}</b>\n`;
+
+    for (const sel of chunk) {
+      subOdds *= sel.odds;
+      subProb *= sel.probability;
+      msg += `  ${sel.match} — ${sel.market} @ ${sel.odds.toFixed(2)}\n`;
+    }
+
+    msg += `  Odds: ${subOdds.toFixed(2)}x | Win prob: ${(subProb * 100).toFixed(1)}%\n\n`;
+  }
+
+  await sendMessage(chatId, msg, env);
+}
+
+// ─── Feature 3: OPTIMIZE (trim to target odds) ────────────────
+
+async function cmdOptimize(chatId, text, env) {
+  const targetMatch = text.match(/(\d+)/);
+  const targetOdds = targetMatch ? parseInt(targetMatch[1]) : 50;
+
+  const ticket = await getLastTicket(env);
+  if (!ticket || !ticket.length) {
+    await sendMessage(chatId, `No ticket to optimize. Say <i>"give me odds"</i> first.`, env);
+    return;
+  }
+
+  // Keep safest legs (lowest odds = highest probability) until we hit target
+  const sorted = [...ticket].sort((a, b) => a.odds - b.odds);
+  const kept = [];
+  const removed = [];
+  let totalOdds = 1;
+
+  for (const sel of sorted) {
+    if (totalOdds * sel.odds <= targetOdds || kept.length === 0) {
+      kept.push(sel);
+      totalOdds *= sel.odds;
+    } else {
+      removed.push(sel);
+    }
+  }
+
+  let jointP = kept.reduce((p, s) => p * s.probability, 1);
+  const winRate = await getWinRate();
+
+  let msg = `<b>Optimized to ${totalOdds.toFixed(2)}x</b>\n`;
+  msg += `Win probability: <b>${(jointP * 100).toFixed(1)}%</b>\n`;
+  if (winRate.count > 0) {
+    msg += `Model win rate: <b>${winRate.pct}%</b>\n`;
+  }
+  msg += `\n<b>Kept (${kept.length}):</b>\n`;
+
+  kept.forEach((k) => {
+    msg += `  ✓ ${k.match} @ ${k.odds.toFixed(2)} (${(k.probability * 100).toFixed(0)}%)\n`;
+  });
+
+  if (removed.length) {
+    msg += `\n<b>Removed (${removed.length}):</b>\n`;
+    removed.forEach((r) => {
+      msg += `  ✗ ${r.match} @ ${r.odds.toFixed(2)}\n`;
+    });
+  }
+
+  await sendMessage(chatId, msg, env);
+}
+
+// ─── Win Rate Tracking ─────────────────────────────────────────
+
+async function getWinRate(env) {
+  // In production this reads from KV/D1
+  // For now return placeholder until we have enough predictions logged
+  return { pct: null, count: 0 };
+}
+
+async function logPrediction(prediction, env) {
+  // Store for win-rate tracking
+  // Will use KV: key=prediction_{date}_{match}, value={match, market, prob, kickoff}
+}
+
+// ─── Prediction Engine ─────────────────────────────────────────
+
+let _modelCache = null;
+let _cacheTime = 0;
+const CACHE_TTL = 3600000; // 1 hour
+
+async function getModel() {
+  if (_modelCache && Date.now() - _cacheTime < CACHE_TTL) return _modelCache;
+
+  let matches = [];
+  
+  // Current season
+  try {
+    matches = await fetchLeagueData("epl");
+  } catch (e) { /* fall through */ }
+
+  // If early season (<50 matches), add previous season
+  if (matches.length < 50) {
+    try {
+      const now = new Date();
+      const year = now.getFullYear();
+      const startYear = now.getMonth() >= 7 ? year : year - 1;
+      const prevSeason = `${String(startYear - 1).slice(2)}${String(startYear).slice(2)}`;
+      
+      const url = `https://www.football-data.co.uk/mmz4281/${prevSeason}/E0.csv`;
+      const resp = await fetch(url, { headers: { "User-Agent": "overline/2.0" } });
+      if (resp.ok) {
+        const csv = await resp.text();
+        const prevMatches = parseCSV(csv);
+        matches = [...prevMatches, ...matches];
+      }
+    } catch (e) { /* continue with what we have */ }
+  }
+
+  _modelCache = fitDixonColes(matches);
+  _cacheTime = Date.now();
+  return _modelCache;
+}
+
+async function getTopPredictions(targetOdds) {
+  const model = await getModel();
+
+  // Generate predictions from strongest vs weakest teams
+  const teamsByStrength = Object.entries(model.teams)
+    .map(([name, p]) => ({ name, score: p.attack / p.defence }))
+    .sort((a, b) => b.score - a.score);
+
+  const selections = [];
+  const used = new Set();
+
+  for (const strong of teamsByStrength.slice(0, 8)) {
+    for (const weak of [...teamsByStrength].reverse()) {
+      if (used.has(strong.name) || used.has(weak.name)) continue;
+      if (strong.name === weak.name) continue;
+
+      const homeP = model.teams[strong.name];
+      const awayP = model.teams[weak.name];
+
+      const lambdaHome = Math.max(0.2,
+        homeP.attack * awayP.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
+      const lambdaAway = Math.max(0.2,
+        awayP.attack * homeP.defence * model.leagueMeanAwayGoals / 1.35);
+
+      // Home win probability via Poisson
+      let homeWin = 0;
+      for (let h = 0; h <= 10; h++) {
+        for (let a = 0; a <= 10; a++) {
+          if (h > a) homeWin += poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+        }
+      }
+
+      const fairOdds = 1 / homeWin;
+      const bookOdds = Math.max(1.05, Math.round(fairOdds * 0.93 * 100) / 100);
+
+      selections.push({
+        match: `${strong.name} vs ${weak.name}`,
+        market: "Home Win",
+        probability: Math.round(homeWin * 1000) / 1000,
+        odds: bookOdds,
+      });
+
+      used.add(strong.name);
+      used.add(weak.name);
+      break; // one pick per strong team
+    }
+  }
+
+  // Sort safest first and accumulate until target reached
+  selections.sort((a, b) => a.odds - b.odds);
+  
+  const ticket = [];
+  let totalOdds = 1;
+  let jointP = 1;
+
+  for (const sel of selections) {
+    ticket.push(sel);
+    totalOdds *= sel.odds;
+    jointP *= sel.probability;
+    if (targetOdds && totalOdds >= targetOdds) break;
+  }
+
+  return {
+    selections: ticket,
+    totalOdds: Math.round(totalOdds * 100) / 100,
+    jointP: jointP,
+  };
+}
+
+async function getLastTicket(env) {
+  // In production: read from KV storage
+  // For MVP: regenerate from model
+  const preds = await getTopPredictions(null);
+  return preds.selections;
+}
+
+// ─── Poisson helper ────────────────────────────────────────────
+
+function poisPmf(k, lambda) {
+  if (k < 0 || lambda <= 0) return 0;
+  let logPmf = -lambda + k * Math.log(lambda);
+  let logFact = 0;
+  for (let i = 2; i <= k; i++) logFact += Math.log(i);
+  return Math.exp(logPmf - logFact);
+}
+
+// ─── Match prediction ──────────────────────────────────────────
+
+async function cmdPredictMatch(chatId, homeInput, awayInput, env) {
+  const model = await getModel();
+
+  const findTeam = (input) => {
+    const lower_input = input.toLowerCase();
+    for (const name of Object.keys(model.teams)) {
+      if (name.toLowerCase().includes(lower_input) ||
+          lower_input.includes(name.toLowerCase().split(" ")[0])) {
+        return name;
+      }
+    }
+    return null;
+  };
+
+  const home = findTeam(homeInput);
+  const away = findTeam(awayInput);
+
+  if (!home || !away) {
+    await sendMessage(chatId,
+      `Couldn't find those teams. I cover Premier League:\n${Object.keys(model.teams).join(", ")}`, env);
+    return;
+  }
+
+  const hp = model.teams[home];
+  const ap = model.teams[away];
+
+  const lambdaHome = Math.max(0.2,
+    hp.attack * ap.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
+  const lambdaAway = Math.max(0.2,
+    ap.attack * hp.defence * model.leagueMeanAwayGoals / 1.35);
+
+  let hw = 0, d = 0, aw = 0, btts = 0, o25 = 0;
+  for (let h = 0; h <= 10; h++) {
+    for (let a = 0; a <= 10; a++) {
+      const p = poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+      if (h > a) hw += p;
+      else if (h === a) d += p;
+      else aw += p;
+      if (h > 0 && a > 0) btts += p;
+      if (h + a > 2.5) o25 += p;
+    }
+  }
+
+  let msg = `<b>${home} vs ${away}</b>\n\n`;
+  msg += `Home Win: <b>${(hw * 100).toFixed(0)}%</b> @ ${(1 / hw * 0.93).toFixed(2)}\n`;
+  msg += `Draw: <b>${(d * 100).toFixed(0)}%</b> @ ${(1 / d * 0.93).toFixed(2)}\n`;
+  msg += `Away Win: <b>${(aw * 100).toFixed(0)}%</b> @ ${(1 / aw * 0.93).toFixed(2)}\n\n`;
+  msg += `xG: ${lambdaHome.toFixed(1)}-${lambdaAway.toFixed(1)}\n`;
+  msg += `BTTS: ${(btts * 100).toFixed(0)}% | Over 2.5: ${(o25 * 100).toFixed(0)}%\n\n`;
+  msg += `<i>Dixon-Coles · full season fit</i>`;
+
+  await sendMessage(chatId, msg, env, inlineKeys([
+    [`Add to ticket`, `add ${home} ${away}`],
+  ]));
 }
