@@ -1,7 +1,6 @@
-// index.js — Overline v2
-// Telegram-first sports prediction bot. Football + Basketball.
-// Three features: Book, Split, Optimize. One metric: win rate.
-// SportyBet for booking.
+// index.js — Overline v3
+// Statistical betting bot. Correct scores, overs, BTTS — model-driven.
+// Football only. Dixon-Coles engine. SportyBet booking via local proxy.
 
 import { fetchLeagueData, parseCSV } from "./engines/live-data.js";
 import { fitDixonColes } from "./engines/dc-model.js";
@@ -19,15 +18,15 @@ export default {
         return new Response("OK");
       } catch (err) {
         console.error("[overline] error:", err.message);
-        return new Response("OK"); // always 200 to Telegram
+        return new Response("OK");
       }
     }
 
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, version: "2.0" });
+      return Response.json({ ok: true, version: "3.0" });
     }
 
-    return new Response("Overline — model P vs the book.", { status: 200 });
+    return new Response("Overline — stats vs the book.", { status: 200 });
   },
 };
 
@@ -46,7 +45,6 @@ async function sendMessage(chatId, text, env, replyMarkup = null) {
     });
     const result = await resp.json();
     if (!result.ok) {
-      // Retry without HTML in case of encoding issues
       delete body.parse_mode;
       await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
@@ -60,9 +58,8 @@ async function sendMessage(chatId, text, env, replyMarkup = null) {
 }
 
 async function sendTyping(chatId, env) {
-  const token = env.OVERLINE_BOT_TOKEN;
   try {
-    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+    await fetch(`https://api.telegram.org/bot${env.OVERLINE_BOT_TOKEN}/sendChatAction`, {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: new TextEncoder().encode(JSON.stringify({ chat_id: String(chatId), action: "typing" })),
@@ -86,32 +83,34 @@ async function handleUpdate(update, env) {
   const text = (update.message.text || "").trim();
   const lower = text.toLowerCase();
 
-  if (!text || text.startsWith("/")) return; // ignore commands and empty
+  if (!text || text.startsWith("/")) return;
 
   await sendTyping(chatId, env);
 
   try {
-    // OPTIMIZE — "optimize", "trim", "trim to 50x"
-    if (/^(?:optimize|optimise|trim)/i.test(lower)) {
-      await cmdOptimize(chatId, text, env);
+    // CORRECT SCORES
+    if (/correct.?score/i.test(lower)) {
+      await cmdCorrectScores(chatId, env);
       return;
     }
 
-    // SPLIT — "split into 3", "split"
-    if (/^split/i.test(lower)) {
-      await cmdSplit(chatId, text, env);
+    // OVERS — "overs 3.5", "over 2.5 today", "high scoring"
+    if (/over|goals|high.?scor/i.test(lower)) {
+      const lineMatch = lower.match(/(\d+\.?\d*)/);
+      const line = lineMatch ? parseFloat(lineMatch[1]) : 2.5;
+      await cmdOvers(chatId, line, env);
       return;
     }
 
-    // WIN RATE — "win rate", "stats", "how accurate"
-    if (/win.?rate|accuracy|how good|stats/i.test(lower)) {
-      await cmdWinRate(chatId, env);
+    // BTTS
+    if (/btts|both.?teams|both.?score/i.test(lower)) {
+      await cmdBTTS(chatId, env);
       return;
     }
 
-    // MEGA/BIG ODDS — "give me X odds", "book me odds"
-    if (/(?:odds|ticket|bet|book)/i.test(lower) && /(?:give|build|make|create|book|get|\d)/i.test(lower)) {
-      await cmdBook(chatId, text, env);
+    // BUILD TICKET — "give me X odds", "build ticket", "book X odds"
+    if (/(?:odds|ticket|book|build|give me)/i.test(lower)) {
+      await cmdBuildTicket(chatId, text, env);
       return;
     }
 
@@ -122,14 +121,30 @@ async function handleUpdate(update, env) {
       return;
     }
 
-    // Default — show what the bot does
+    // WIN RATE
+    if (/win.?rate|accuracy|stats/i.test(lower)) {
+      await sendMessage(chatId, `Win rate tracking coming soon. The model needs more predictions to calculate accuracy.`, env);
+      return;
+    }
+
+    // HELP / DEFAULT
     await sendMessage(chatId,
-      `I predict games and build tickets.\n\n` +
-      `<i>"give me odds"</i> — today's best picks\n` +
-      `<i>"Arsenal vs Chelsea"</i> — match prediction\n` +
-      `<i>"trim to 50x"</i> — optimize a ticket\n` +
-      `<i>"split into 3"</i> — split into smaller bets\n` +
-      `<i>"win rate"</i> — model accuracy\n`, env);
+      `<b>Overline</b>\n\n` +
+      `Just tell me what you want.\n\n` +
+      `<b>Build a ticket</b>\n` +
+      `• Book 20 odds\n` +
+      `• Book 50 odds over 1.5 only\n` +
+      `• Correct scores today\n` +
+      `• BTTS picks\n\n` +
+      `<b>Match analysis</b>\n` +
+      `• Arsenal vs Chelsea\n` +
+      `• Over 3.5 today\n\n` +
+      `<b>Stats markets</b>\n` +
+      `• Corners (coming soon)\n` +
+      `• Cards (coming soon)\n` +
+      `• Player to score (coming soon)\n\n` +
+      `<b>Useful</b>\n` +
+      `• Win rate\n`, env);
 
   } catch (err) {
     console.error("[overline] handler:", err.message);
@@ -137,358 +152,55 @@ async function handleUpdate(update, env) {
   }
 }
 
-// ─── Feature 1: BOOK TICKETS ───────────────────────────────────
-
-
-function getDates() {
-  const now = new Date();
-  const fmt = (d) => {
-    const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    return `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
-  };
-  return {
-    today: fmt(now),
-    tomorrow: fmt(new Date(now.getTime() + 86400000)),
-    dayAfter: fmt(new Date(now.getTime() + 2 * 86400000)),
-  };
-}
-
-
-async function cmdBook(chatId, text, env) {
-  // Parse target odds from message
-  let targetOdds = null;
-  const mMatch = text.match(/(\d+)\s*m(?:illion)?/i);
-  const kMatch = text.match(/(\d+)\s*k\b/i);
-  const xMatch = text.match(/(\d+)\s*x\b/i);
-  const plainMatch = text.match(/\b(\d{2,7})\b/);
-
-  if (mMatch) targetOdds = parseInt(mMatch[1]) * 1000000;
-  else if (kMatch) targetOdds = parseInt(kMatch[1]) * 1000;
-  else if (xMatch) targetOdds = parseInt(xMatch[1]);
-  else if (plainMatch) targetOdds = parseInt(plainMatch[1]);
-
-  await sendMessage(chatId, `Building ticket...`, env);
-  const predictions = await getTopPredictions(targetOdds);
-
-  if (!predictions.selections.length) {
-    await sendMessage(chatId, `No confident picks available right now. Check back later.`, env);
-    return;
-  }
-
-  const winRate = await getWinRate();
-  let msg = `<b>Ticket</b>\n`;
-  msg += `Total odds: <b>${predictions.totalOdds.toLocaleString()}x</b>\n`;
-  msg += `Win probability: <b>${(predictions.jointP * 100).toFixed(1)}%</b>\n`;
-  msg += `Legs: ${predictions.selections.length}\n`;
-  if (winRate.count > 0) {
-    msg += `Model win rate: <b>${winRate.pct}%</b> (${winRate.count} predictions)\n`;
-  }
-  msg += `\n`;
-
-  predictions.selections.forEach((s, i) => {
-    msg += `${i + 1}. <b>${s.match}</b>\n`;
-    msg += `   🕐 ${s.kickoff || "TBD"}\n`;
-    msg += `   ${s.market} @ ${s.odds.toFixed(2)} (${(s.probability * 100).toFixed(0)}%)\n`;
-  });
-
-  msg += `\n<i>Add these to your SportyBet slip.</i>`;
-
-  await sendMessage(chatId, msg, env, inlineKeys([
-    [`Optimize to 50x`, `optimize to 50`],
-    [`Split into 3`, `split into 3`],
-    [`Win rate`, `win rate`],
-  ]));
-}
-
-// ─── Feature 2: SPLIT ──────────────────────────────────────────
-
-async function cmdSplit(chatId, text, env) {
-  const partsMatch = text.match(/(\d+)/);
-  const parts = partsMatch ? Math.min(parseInt(partsMatch[1]), 10) : 3;
-
-  // Get the last built ticket from KV or rebuild
-  const ticket = await getLastTicket(env);
-  if (!ticket || !ticket.length) {
-    await sendMessage(chatId, `No ticket to split. Say <i>"give me odds"</i> first.`, env);
-    return;
-  }
-
-  const perPart = Math.ceil(ticket.length / parts);
-  let msg = `<b>Split into ${parts} tickets</b>\n\n`;
-
-  for (let i = 0; i < parts; i++) {
-    const chunk = ticket.slice(i * perPart, (i + 1) * perPart);
-    if (!chunk.length) break;
-
-    let subOdds = 1;
-    let subProb = 1;
-    msg += `<b>Ticket ${i + 1}</b>\n`;
-
-    for (const sel of chunk) {
-      subOdds *= sel.odds;
-      subProb *= sel.probability;
-      msg += `  ${sel.match} — ${sel.market} @ ${sel.odds.toFixed(2)}\n`;
-    }
-
-    msg += `  Odds: ${subOdds.toFixed(2)}x | Win prob: ${(subProb * 100).toFixed(1)}%\n\n`;
-  }
-
-  await sendMessage(chatId, msg, env);
-}
-
-// ─── Feature 3: OPTIMIZE (trim to target odds) ────────────────
-
-async function cmdOptimize(chatId, text, env) {
-  const targetMatch = text.match(/(\d+)/);
-  const targetOdds = targetMatch ? parseInt(targetMatch[1]) : 50;
-
-  const ticket = await getLastTicket(env);
-  if (!ticket || !ticket.length) {
-    await sendMessage(chatId, `No ticket to optimize. Say <i>"give me odds"</i> first.`, env);
-    return;
-  }
-
-  // Keep safest legs (lowest odds = highest probability) until we hit target
-  const sorted = [...ticket].sort((a, b) => a.odds - b.odds);
-  const kept = [];
-  const removed = [];
-  let totalOdds = 1;
-
-  for (const sel of sorted) {
-    if (totalOdds * sel.odds <= targetOdds || kept.length === 0) {
-      kept.push(sel);
-      totalOdds *= sel.odds;
-    } else {
-      removed.push(sel);
-    }
-  }
-
-  let jointP = kept.reduce((p, s) => p * s.probability, 1);
-  const winRate = await getWinRate();
-
-  let msg = `<b>Optimized to ${totalOdds.toFixed(2)}x</b>\n`;
-  msg += `Win probability: <b>${(jointP * 100).toFixed(1)}%</b>\n`;
-  if (winRate.count > 0) {
-    msg += `Model win rate: <b>${winRate.pct}%</b>\n`;
-  }
-  msg += `\n<b>Kept (${kept.length}):</b>\n`;
-
-  kept.forEach((k) => {
-    msg += `  ✓ ${k.match} @ ${k.odds.toFixed(2)} (${(k.probability * 100).toFixed(0)}%)\n`;
-  });
-
-  if (removed.length) {
-    msg += `\n<b>Removed (${removed.length}):</b>\n`;
-    removed.forEach((r) => {
-      msg += `  ✗ ${r.match} @ ${r.odds.toFixed(2)}\n`;
-    });
-  }
-
-  await sendMessage(chatId, msg, env);
-}
-
-// ─── Win Rate Tracking ─────────────────────────────────────────
-
-async function getWinRate(env) {
-  // In production this reads from KV/D1
-  // For now return placeholder until we have enough predictions logged
-  return { pct: null, count: 0 };
-}
-
-async function logPrediction(prediction, env) {
-  // Store for win-rate tracking
-  // Will use KV: key=prediction_{date}_{match}, value={match, market, prob, kickoff}
-}
-
-// ─── Prediction Engine ─────────────────────────────────────────
+// ─── Dixon-Coles Engine ────────────────────────────────────────
 
 let _modelCache = null;
 let _cacheTime = 0;
-const CACHE_TTL = 3600000; // 1 hour
+const CACHE_TTL = 3600000;
 
 async function getModel() {
   if (_modelCache && Date.now() - _cacheTime < CACHE_TTL) return _modelCache;
 
   let matches = [];
-  
-  // Current season
-  try {
-    matches = await fetchLeagueData("epl");
-  } catch (e) { /* fall through */ }
 
-  // If early season (<50 matches), add previous season
-  if (matches.length < 50) {
+  // Fetch EPL + Championship (current season)
+  const now = new Date();
+  const year = now.getFullYear();
+  const startYear = now.getMonth() >= 7 ? year : year - 1;
+  const season = `${String(startYear).slice(2)}${String(startYear + 1).slice(2)}`;
+
+  for (const code of ["E0", "E1"]) {
     try {
-      const now = new Date();
-      const year = now.getFullYear();
-      const startYear = now.getMonth() >= 7 ? year : year - 1;
-      const prevSeason = `${String(startYear - 1).slice(2)}${String(startYear).slice(2)}`;
-      
-      const url = `https://www.football-data.co.uk/mmz4281/${prevSeason}/E0.csv`;
-      const resp = await fetch(url, { headers: { "User-Agent": "overline/2.0" } });
+      const url = `https://www.football-data.co.uk/mmz4281/${season}/${code}.csv`;
+      const resp = await fetch(url, { headers: { "User-Agent": "overline/3.0" } });
       if (resp.ok) {
         const csv = await resp.text();
-        const prevMatches = parseCSV(csv);
-        matches = [...prevMatches, ...matches];
+        const parsed = parseCSV(csv);
+        matches = [...matches, ...parsed];
       }
-    } catch (e) { /* continue with what we have */ }
+    } catch (e) { /* continue */ }
+  }
+
+  // If early season, add previous season too
+  if (matches.length < 50) {
+    const prevSeason = `${String(startYear - 1).slice(2)}${String(startYear).slice(2)}`;
+    for (const code of ["E0", "E1"]) {
+      try {
+        const url = `https://www.football-data.co.uk/mmz4281/${prevSeason}/${code}.csv`;
+        const resp = await fetch(url, { headers: { "User-Agent": "overline/3.0" } });
+        if (resp.ok) {
+          const csv = await resp.text();
+          const parsed = parseCSV(csv);
+          matches = [...parsed, ...matches];
+        }
+      } catch (e) { /* continue */ }
+    }
   }
 
   _modelCache = fitDixonColes(matches);
   _cacheTime = Date.now();
   return _modelCache;
 }
-
-async function getTopPredictions(targetOdds) {
-  const model = await getModel();
-
-  // Build high-value picks: correct score, extreme O/U, BTTS+over combos
-  const selections = [];
-  const teamsByStrength = Object.entries(model.teams)
-    .map(([name, p]) => ({ name, score: p.attack / p.defence }))
-    .sort((a, b) => b.score - a.score);
-
-  const used = new Set();
-
-  const dates = getDates();
-  const kickoffTimes = [
-    `Today 17:30`, `Today 20:00`, 
-    `${dates.tomorrow} 16:00`, `${dates.tomorrow} 18:30`, `${dates.tomorrow} 20:45`,
-  ];
-
-  for (const strong of teamsByStrength.slice(0, 10)) {
-    for (const weak of [...teamsByStrength].reverse()) {
-      if (used.has(strong.name) || used.has(weak.name)) continue;
-      if (strong.name === weak.name) continue;
-
-      const homeP = model.teams[strong.name];
-      const awayP = model.teams[weak.name];
-
-      const lambdaHome = Math.max(0.2,
-        homeP.attack * awayP.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
-      const lambdaAway = Math.max(0.2,
-        awayP.attack * homeP.defence * model.leagueMeanAwayGoals / 1.35);
-
-      // Build the full score probability matrix
-      const matrix = [];
-      let total = 0;
-      for (let h = 0; h <= 8; h++) {
-        matrix[h] = [];
-        for (let a = 0; a <= 8; a++) {
-          const p = poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
-          matrix[h][a] = p;
-          total += p;
-        }
-      }
-      for (let h = 0; h <= 8; h++)
-        for (let a = 0; a <= 8; a++)
-          matrix[h][a] /= total;
-
-      // MARKET 1: Most likely correct score (typically 6x-15x)
-      let bestScore = { h: 0, a: 0, p: 0 };
-      for (let h = 0; h <= 5; h++) {
-        for (let a = 0; a <= 5; a++) {
-          if (matrix[h][a] > bestScore.p) {
-            bestScore = { h, a, p: matrix[h][a] };
-          }
-        }
-      }
-      const csOdds = Math.max(6, Math.round(1 / bestScore.p * 0.85)); // bookie margin
-      if (bestScore.p > 0.05) {
-        selections.push({
-          match: `${strong.name} vs ${weak.name}`,
-          market: `Correct Score ${bestScore.h}-${bestScore.a}`,
-          probability: Math.round(bestScore.p * 1000) / 1000,
-          odds: csOdds,
-          type: "correct_score",
-          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
-        });
-      }
-
-      // MARKET 2: Over 3.5 goals (high-scoring games only)
-      let over35 = 0;
-      for (let h = 0; h <= 8; h++)
-        for (let a = 0; a <= 8; a++)
-          if (h + a > 3.5) over35 += matrix[h][a];
-      
-      if (lambdaHome + lambdaAway > 2.8 && over35 > 0.15) {
-        const o35Odds = Math.max(3, Math.round(1 / over35 * 0.9 * 100) / 100);
-        selections.push({
-          match: `${strong.name} vs ${weak.name}`,
-          market: "Over 3.5 Goals",
-          probability: Math.round(over35 * 1000) / 1000,
-          odds: o35Odds,
-          type: "goals",
-          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
-        });
-      }
-
-      // MARKET 3: BTTS + Over 2.5 combo (higher odds than either alone)
-      let bttsAndO25 = 0;
-      for (let h = 1; h <= 8; h++)
-        for (let a = 1; a <= 8; a++)
-          if (h + a > 2.5) bttsAndO25 += matrix[h][a];
-
-      if (bttsAndO25 > 0.20) {
-        const bttsOdds = Math.max(2.5, Math.round(1 / bttsAndO25 * 0.88 * 100) / 100);
-        selections.push({
-          match: `${strong.name} vs ${weak.name}`,
-          market: "BTTS + Over 2.5",
-          probability: Math.round(bttsAndO25 * 1000) / 1000,
-          odds: bttsOdds,
-          type: "combo",
-          kickoff: kickoffTimes[selections.length % kickoffTimes.length],
-        });
-      }
-
-      used.add(strong.name);
-      used.add(weak.name);
-      break;
-    }
-
-    if (selections.length >= 12) break; // enough picks to build from
-  }
-
-  // Sort by VALUE: odds × probability (expected value per unit staked)
-  // Higher value = better return relative to risk
-  selections.sort((a, b) => (b.odds * b.probability) - (a.odds * a.probability));
-
-  // Accumulate until target reached — prioritize high-odds legs
-  const ticket = [];
-  let totalOdds = 1;
-  let jointP = 1;
-
-  // For mega odds tickets: pick the highest-value legs
-  // For smaller targets: mix of value and safety
-  const sortedForTarget = targetOdds && targetOdds > 100
-    ? [...selections].sort((a, b) => b.odds - a.odds)  // big target → biggest legs first
-    : selections;
-
-  for (const sel of sortedForTarget) {
-    ticket.push(sel);
-    totalOdds *= sel.odds;
-    jointP *= sel.probability;
-    if (targetOdds && totalOdds >= targetOdds) break;
-    if (!targetOdds && ticket.length >= 5) break; // default: 5 legs
-  }
-
-  return {
-    selections: ticket,
-    totalOdds: Math.round(totalOdds * 100) / 100,
-    jointP: jointP,
-  };
-}
-
-
-async function getLastTicket(env) {
-  // In production: read from KV storage
-  // For MVP: regenerate from model
-  const preds = await getTopPredictions(null);
-  return preds.selections;
-}
-
-// ─── Poisson helper ────────────────────────────────────────────
 
 function poisPmf(k, lambda) {
   if (k < 0 || lambda <= 0) return 0;
@@ -498,60 +210,424 @@ function poisPmf(k, lambda) {
   return Math.exp(logPmf - logFact);
 }
 
-// ─── Match prediction ──────────────────────────────────────────
-
-async function cmdPredictMatch(chatId, homeInput, awayInput, env) {
-  const model = await getModel();
-
-  const findTeam = (input) => {
-    const lower_input = input.toLowerCase();
-    for (const name of Object.keys(model.teams)) {
-      if (name.toLowerCase().includes(lower_input) ||
-          lower_input.includes(name.toLowerCase().split(" ")[0])) {
-        return name;
-      }
+function buildScoreMatrix(lambdaHome, lambdaAway, maxGoals = 8) {
+  const grid = [];
+  let total = 0;
+  for (let h = 0; h <= maxGoals; h++) {
+    grid[h] = [];
+    for (let a = 0; a <= maxGoals; a++) {
+      const p = poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+      grid[h][a] = p;
+      total += p;
     }
-    return null;
-  };
-
-  const home = findTeam(homeInput);
-  const away = findTeam(awayInput);
-
-  if (!home || !away) {
-    await sendMessage(chatId,
-      `Couldn't find those teams. I cover Premier League:\n${Object.keys(model.teams).join(", ")}`, env);
-    return;
   }
+  // Normalize
+  for (let h = 0; h <= maxGoals; h++)
+    for (let a = 0; a <= maxGoals; a++)
+      grid[h][a] /= total;
 
-  const hp = model.teams[home];
-  const ap = model.teams[away];
+  return grid;
+}
+
+function getTeamPair(model, strongTeam, weakTeam) {
+  const hp = model.teams[strongTeam];
+  const ap = model.teams[weakTeam];
 
   const lambdaHome = Math.max(0.2,
     hp.attack * ap.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
   const lambdaAway = Math.max(0.2,
     ap.attack * hp.defence * model.leagueMeanAwayGoals / 1.35);
 
-  let hw = 0, d = 0, aw = 0, btts = 0, o25 = 0;
-  for (let h = 0; h <= 10; h++) {
-    for (let a = 0; a <= 10; a++) {
-      const p = poisPmf(h, lambdaHome) * poisPmf(a, lambdaAway);
+  return { lambdaHome, lambdaAway };
+}
+
+function fuzzyFind(model, name) {
+  const lower = name.toLowerCase();
+  for (const team of Object.keys(model.teams)) {
+    const tl = team.toLowerCase();
+    if (tl === lower) return team;
+    if (tl.length >= 4 && (tl.includes(lower) || lower.includes(tl))) return team;
+  }
+  // Word overlap
+  const stop = new Set(["fc", "city", "united", "town", "afc"]);
+  const nw = new Set(lower.split(" ").filter(w => !stop.has(w)));
+  for (const team of Object.keys(model.teams)) {
+    const tw = new Set(team.toLowerCase().split(" ").filter(w => !stop.has(w)));
+    if (nw.size && tw.size && [...nw].some(w => tw.has(w))) return team;
+  }
+  return null;
+}
+
+// ─── Feature: CORRECT SCORES ──────────────────────────────────
+
+async function cmdCorrectScores(chatId, env) {
+  const model = await getModel();
+
+  const teamsByStrength = Object.entries(model.teams)
+    .map(([name, p]) => ({ name, score: p.attack / p.defence }))
+    .sort((a, b) => b.score - a.score);
+
+  const picks = [];
+  const used = new Set();
+
+  for (const strong of teamsByStrength.slice(0, 10)) {
+    for (const weak of [...teamsByStrength].reverse()) {
+      if (used.has(strong.name) || used.has(weak.name)) continue;
+      if (strong.name === weak.name) continue;
+
+      const { lambdaHome, lambdaAway } = getTeamPair(model, strong.name, weak.name);
+      const grid = buildScoreMatrix(lambdaHome, lambdaAway);
+
+      // Find top 3 correct scores
+      const scores = [];
+      for (let h = 0; h <= 5; h++) {
+        for (let a = 0; a <= 5; a++) {
+          scores.push({ score: `${h}-${a}`, prob: grid[h][a], h, a });
+        }
+      }
+      scores.sort((a, b) => b.prob - a.prob);
+
+      const best = scores[0];
+      if (best.prob > 0.08) {
+        // Fair odds with 15% bookmaker margin (CS markets have high margins)
+        const fairOdds = 1 / best.prob;
+        const bookOdds = Math.round(fairOdds * 0.85 * 100) / 100;
+
+        picks.push({
+          match: `${strong.name} vs ${weak.name}`,
+          score: best.score,
+          probability: best.prob,
+          odds: Math.max(4, bookOdds),
+        });
+      }
+
+      used.add(strong.name);
+      used.add(weak.name);
+      break;
+    }
+
+    if (picks.length >= 5) break;
+  }
+
+  picks.sort((a, b) => b.probability - a.probability);
+
+  let msg = `<b>🎯 Correct Score Picks</b>\n\n`;
+  picks.forEach((p, i) => {
+    msg += `${i + 1}. <b>${p.match}</b>\n`;
+    msg += `   ${p.score} @ ${p.odds.toFixed(2)} (${(p.probability * 100).toFixed(1)}%)\n`;
+  });
+
+  await sendMessage(chatId, msg, env, inlineKeys([
+    ["Build CS ticket", "build ticket from correct scores"],
+  ]));
+}
+
+// ─── Feature: OVERS ────────────────────────────────────────────
+
+async function cmdOvers(chatId, line, env) {
+  const model = await getModel();
+
+  const teamsByStrength = Object.entries(model.teams)
+    .map(([name, p]) => ({ name, attack: p.attack }))
+    .sort((a, b) => b.attack - a.attack);
+
+  const picks = [];
+  const used = new Set();
+
+  // Pair highest-attack teams together (most likely to score goals)
+  for (let i = 0; i < Math.min(teamsByStrength.length - 1, 8); i += 2) {
+    const teamA = teamsByStrength[i];
+    const teamB = teamsByStrength[i + 1];
+
+    if (used.has(teamA.name) || used.has(teamB.name)) continue;
+
+    const hpA = model.teams[teamA.name];
+    const hpB = model.teams[teamB.name];
+
+    const lambdaH = Math.max(0.2,
+      hpA.attack * hpB.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
+    const lambdaA = Math.max(0.2,
+      hpB.attack * hpA.defence * model.leagueMeanAwayGoals / 1.35);
+
+    const grid = buildScoreMatrix(lambdaH, lambdaA);
+
+    // Calculate P(total > line)
+    let overProb = 0;
+    for (let h = 0; h <= 8; h++) {
+      for (let a = 0; a <= 8; a++) {
+        if (h + a > line) overProb += grid[h][a];
+      }
+    }
+
+    if (overProb > 0.30) { // only show if decent chance
+      const fairOdds = 1 / overProb;
+      const bookOdds = Math.round(fairOdds * 0.92 * 100) / 100;
+
+      picks.push({
+        match: `${teamA.name} vs ${teamB.name}`,
+        market: `Over ${line}`,
+        probability: overProb,
+        odds: Math.max(1.5, bookOdds),
+        xg: (lambdaH + lambdaA).toFixed(1),
+      });
+    }
+
+    used.add(teamA.name);
+    used.add(teamB.name);
+  }
+
+  picks.sort((a, b) => b.probability - a.probability);
+
+  let msg = `<b>⚽ Over ${line} Goals</b>\n\n`;
+  picks.forEach((p, i) => {
+    msg += `${i + 1}. <b>${p.match}</b>\n`;
+    msg += `   Over ${line} @ ${p.odds.toFixed(2)} (${(p.probability * 100).toFixed(0)}%)\n`;
+    msg += `   xG total: ${p.xg}\n`;
+  });
+
+  if (!picks.length) {
+    msg += `No strong over picks today. Try a lower line.`;
+  }
+
+  await sendMessage(chatId, msg, env);
+}
+
+// ─── Feature: BTTS ─────────────────────────────────────────────
+
+async function cmdBTTS(chatId, env) {
+  const model = await getModel();
+
+  // Find teams with balanced attack AND weak defence (both likely to score)
+  const teams = Object.entries(model.teams)
+    .map(([name, p]) => ({ name, combined: p.attack + (2 - p.defence) }))
+    .sort((a, b) => b.combined - a.combined);
+
+  const picks = [];
+  const used = new Set();
+
+  for (let i = 0; i < Math.min(teams.length - 1, 8); i += 2) {
+    const teamA = teams[i];
+    const teamB = teams[i + 1];
+
+    if (used.has(teamA.name) || used.has(teamB.name)) continue;
+
+    const hpA = model.teams[teamA.name];
+    const hpB = model.teams[teamB.name];
+
+    const lambdaH = Math.max(0.2,
+      hpA.attack * hpB.defence * model.homeAdvantage * model.leagueMeanHomeGoals / 1.35);
+    const lambdaA = Math.max(0.2,
+      hpB.attack * hpA.defence * model.leagueMeanAwayGoals / 1.35);
+
+    const grid = buildScoreMatrix(lambdaH, lambdaA);
+
+    let bttsProb = 0;
+    for (let h = 1; h <= 8; h++) {
+      for (let a = 1; a <= 8; a++) {
+        bttsProb += grid[h][a];
+      }
+    }
+
+    if (bttsProb > 0.45) {
+      const fairOdds = 1 / bttsProb;
+      const bookOdds = Math.round(fairOdds * 0.90 * 100) / 100;
+
+      picks.push({
+        match: `${teamA.name} vs ${teamB.name}`,
+        market: "BTTS Yes",
+        probability: bttsProb,
+        odds: Math.max(1.5, bookOdds),
+      });
+    }
+
+    used.add(teamA.name);
+    used.add(teamB.name);
+  }
+
+  picks.sort((a, b) => b.probability - a.probability);
+
+  let msg = `<b>🥅 BTTS Picks</b>\n\n`;
+  picks.forEach((p, i) => {
+    msg += `${i + 1}. <b>${p.match}</b>\n`;
+    msg += `   BTTS @ ${p.odds.toFixed(2)} (${(p.probability * 100).toFixed(0)}%)\n`;
+  });
+
+  await sendMessage(chatId, msg, env);
+}
+
+// ─── Feature: BUILD TICKET ─────────────────────────────────────
+
+async function cmdBuildTicket(chatId, text, env) {
+  // Parse target odds
+  let target = null;
+  const mMatch = text.match(/(\d+)\s*m(?:illion)?/i);
+  const kMatch = text.match(/(\d+)\s*k\b/i);
+  const xMatch = text.match(/(\d+)\s*x?\b/i);
+  const plain = text.match(/\b(\d{2,7})\b/);
+
+  if (mMatch) target = parseInt(mMatch[1]) * 1000000;
+  else if (kMatch) target = parseInt(kMatch[1]) * 1000;
+  else if (xMatch) target = parseInt(xMatch[1]);
+  else if (plain) target = parseInt(plain[1]);
+
+  const model = await getModel();
+  const teamsByStrength = Object.entries(model.teams)
+    .map(([name, p]) => ({ name, score: p.attack / p.defence }))
+    .sort((a, b) => b.score - a.score);
+
+  // Generate all high-value picks across markets
+  const allPicks = [];
+  const used = new Set();
+
+  for (const strong of teamsByStrength.slice(0, 12)) {
+    for (const weak of [...teamsByStrength].reverse()) {
+      if (used.has(strong.name) || used.has(weak.name)) continue;
+      if (strong.name === weak.name) continue;
+
+      const { lambdaHome, lambdaAway } = getTeamPair(model, strong.name, weak.name);
+      const grid = buildScoreMatrix(lambdaHome, lambdaAway);
+
+      // 1. Best correct score
+      let bestCS = { score: "", prob: 0 };
+      for (let h = 0; h <= 5; h++) {
+        for (let a = 0; a <= 5; a++) {
+          if (grid[h][a] > bestCS.prob) {
+            bestCS = { score: `${h}-${a}`, prob: grid[h][a] };
+          }
+        }
+      }
+      if (bestCS.prob > 0.07) {
+        allPicks.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: `CS ${bestCS.score}`,
+          probability: bestCS.prob,
+          odds: Math.max(4, Math.round(1 / bestCS.prob * 0.85)),
+          type: "cs",
+        });
+      }
+
+      // 2. Over 3.5
+      let o35 = 0;
+      for (let h = 0; h <= 8; h++)
+        for (let a = 0; a <= 8; a++)
+          if (h + a > 3.5) o35 += grid[h][a];
+      if (o35 > 0.15) {
+        allPicks.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: "Over 3.5",
+          probability: o35,
+          odds: Math.max(2.5, Math.round(1 / o35 * 0.90 * 100) / 100),
+          type: "goals",
+        });
+      }
+
+      // 3. BTTS + Over 2.5
+      let bttsO25 = 0;
+      for (let h = 1; h <= 8; h++)
+        for (let a = 1; a <= 8; a++)
+          if (h + a > 2.5) bttsO25 += grid[h][a];
+      if (bttsO25 > 0.20) {
+        allPicks.push({
+          match: `${strong.name} vs ${weak.name}`,
+          market: "BTTS + O2.5",
+          probability: bttsO25,
+          odds: Math.max(2, Math.round(1 / bttsO25 * 0.88 * 100) / 100),
+          type: "combo",
+        });
+      }
+
+      used.add(strong.name);
+      used.add(weak.name);
+      break;
+    }
+    if (allPicks.length >= 15) break;
+  }
+
+  // Build ticket — for high targets prioritize high odds, for low targets prioritize probability
+  allPicks.sort((a, b) => {
+    if (target && target > 100) return b.odds - a.odds;
+    return (b.probability * b.odds) - (a.probability * a.odds); // EV sorting
+  });
+
+  const ticket = [];
+  let totalOdds = 1;
+  let jointProb = 1;
+
+  for (const pick of allPicks) {
+    // Don't pick two markets from the same match
+    if (ticket.some(t => t.match === pick.match)) continue;
+
+    ticket.push(pick);
+    totalOdds *= pick.odds;
+    jointProb *= pick.probability;
+
+    if (target && totalOdds >= target) break;
+    if (!target && ticket.length >= 4) break; // default 4 legs
+  }
+
+  totalOdds = Math.round(totalOdds * 100) / 100;
+
+  let msg = `<b>🎫 Ticket</b>\n`;
+  msg += `Total: <b>${totalOdds.toLocaleString()}x</b>\n`;
+  msg += `Win probability: <b>${(jointProb * 100).toFixed(2)}%</b>\n`;
+  msg += `Legs: ${ticket.length}\n\n`;
+
+  ticket.forEach((t, i) => {
+    msg += `${i + 1}. <b>${t.match}</b>\n`;
+    msg += `   ${t.market} @ ${t.odds.toFixed(2)} (${(t.probability * 100).toFixed(0)}%)\n`;
+  });
+
+  await sendMessage(chatId, msg, env, inlineKeys([
+    [`Optimize to 50x`, `optimize to 50`],
+    [`More odds`, `give me ${Math.round(totalOdds * 10)} odds`],
+  ]));
+}
+
+// ─── Feature: MATCH PREDICTION ────────────────────────────────
+
+async function cmdPredictMatch(chatId, homeInput, awayInput, env) {
+  const model = await getModel();
+
+  const home = fuzzyFind(model, homeInput);
+  const away = fuzzyFind(model, awayInput);
+
+  if (!home || !away) {
+    const available = Object.keys(model.teams).slice(0, 15).join(", ");
+    await sendMessage(chatId, `Couldn't find those teams. I cover:\n${available}...`, env);
+    return;
+  }
+
+  const { lambdaHome, lambdaAway } = getTeamPair(model, home, away);
+  const grid = buildScoreMatrix(lambdaHome, lambdaAway);
+
+  let hw = 0, d = 0, aw = 0, btts = 0, o25 = 0, o35 = 0;
+  for (let h = 0; h <= 8; h++) {
+    for (let a = 0; a <= 8; a++) {
+      const p = grid[h][a];
       if (h > a) hw += p;
       else if (h === a) d += p;
       else aw += p;
       if (h > 0 && a > 0) btts += p;
       if (h + a > 2.5) o25 += p;
+      if (h + a > 3.5) o35 += p;
     }
   }
 
-  let msg = `<b>${home} vs ${away}</b>\n\n`;
-  msg += `Home Win: <b>${(hw * 100).toFixed(0)}%</b> @ ${(1 / hw * 0.93).toFixed(2)}\n`;
-  msg += `Draw: <b>${(d * 100).toFixed(0)}%</b> @ ${(1 / d * 0.93).toFixed(2)}\n`;
-  msg += `Away Win: <b>${(aw * 100).toFixed(0)}%</b> @ ${(1 / aw * 0.93).toFixed(2)}\n\n`;
-  msg += `xG: ${lambdaHome.toFixed(1)}-${lambdaAway.toFixed(1)}\n`;
-  msg += `BTTS: ${(btts * 100).toFixed(0)}% | Over 2.5: ${(o25 * 100).toFixed(0)}%\n\n`;
-  msg += `<i>Dixon-Coles · full season fit</i>`;
+  // Top 3 correct scores
+  const scores = [];
+  for (let h = 0; h <= 5; h++)
+    for (let a = 0; a <= 5; a++)
+      scores.push({ score: `${h}-${a}`, prob: grid[h][a] });
+  scores.sort((a, b) => b.prob - a.prob);
 
-  await sendMessage(chatId, msg, env, inlineKeys([
-    [`Add to ticket`, `add ${home} ${away}`],
-  ]));
+  let msg = `<b>${home} vs ${away}</b>\n\n`;
+  msg += `Win: <b>${(hw * 100).toFixed(0)}%</b> / ${((d) * 100).toFixed(0)}% / ${(aw * 100).toFixed(0)}%\n`;
+  msg += `xG: ${lambdaHome.toFixed(1)}-${lambdaAway.toFixed(1)}\n\n`;
+  msg += `BTTS: ${(btts * 100).toFixed(0)}% | O2.5: ${(o25 * 100).toFixed(0)}% | O3.5: ${(o35 * 100).toFixed(0)}%\n\n`;
+  msg += `<b>Top scores:</b>\n`;
+  scores.slice(0, 3).forEach(s => {
+    msg += `  ${s.score} — ${(s.prob * 100).toFixed(1)}% @ ${(1 / s.prob * 0.85).toFixed(2)}\n`;
+  });
+
+  await sendMessage(chatId, msg, env);
 }
