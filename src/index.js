@@ -5,6 +5,39 @@
 import { fetchLeagueData, parseCSV } from "./engines/live-data.js";
 import { fitDixonColes } from "./engines/dc-model.js";
 
+// ─── Live SportyBet Fixtures from KV ──────────────────────────
+
+async function getLiveFixtures(env) {
+  if (!env.FIXTURES) return [];
+  try {
+    const data = await env.FIXTURES.get("todays_fixtures", "json");
+    return data?.matches || [];
+  } catch (e) {
+    console.error("[overline] KV read error:", e.message);
+    return [];
+  }
+}
+
+// Match our model team names to SportyBet team names
+function matchToSportybet(modelTeam, sportyMatches) {
+  const lower = modelTeam.toLowerCase();
+  
+  for (const match of sportyMatches) {
+    const homeLower = (match.home_team || "").toLowerCase();
+    const awayLower = (match.away_team || "").toLowerCase();
+    
+    // Check if model team matches either side
+    if (homeLower.includes(lower) || lower.includes(homeLower)) {
+      return { ...match, role: "home" };
+    }
+    if (awayLower.includes(lower) || lower.includes(awayLower)) {
+      return { ...match, role: "away" };
+    }
+  }
+  return null;
+}
+
+
 // ─── Worker entry ──────────────────────────────────────────────
 
 export default {
@@ -576,6 +609,32 @@ async function cmdBuildTicket(chatId, text, env) {
     msg += `${i + 1}. <b>${t.match}</b>\n`;
     msg += `   ${t.market} @ ${t.odds.toFixed(2)} (${(t.probability * 100).toFixed(0)}%)\n`;
   });
+
+  // Try to add SportyBet event IDs for booking
+  const liveFixtures = await getLiveFixtures(env);
+  let hasBookingInfo = false;
+  
+  if (liveFixtures.length > 0) {
+    ticket.forEach(t => {
+      const teams = t.match.split(" vs ");
+      const homeMatch = matchToSportybet(teams[0]?.trim(), liveFixtures);
+      const awayMatch = matchToSportybet(teams[1]?.trim(), liveFixtures);
+      
+      if (homeMatch && homeMatch.event_id) {
+        t.sportybet_id = homeMatch.event_id;
+        t.sportybet_match = `${homeMatch.home_team} vs ${homeMatch.away_team}`;
+        hasBookingInfo = true;
+      }
+    });
+  }
+  
+  if (hasBookingInfo) {
+    msg += `\n<b>📱 SportyBet matches:</b>\n`;
+    ticket.filter(t => t.sportybet_id).forEach(t => {
+      msg += `  ${t.sportybet_match} (ID: ${t.sportybet_id})\n`;
+    });
+    msg += `\n<i>Add these to your SportyBet slip using the match names.</i>`;
+  }
 
   await sendMessage(chatId, msg, env, inlineKeys([
     [`Optimize to 50x`, `optimize to 50`],

@@ -151,6 +151,47 @@ def parse_sportybet_matches(raw_text):
     return matches
 
 
+
+CF_KV_NAMESPACE = "f4a1cf24e5d94b5b806b06058d3ef780"
+CF_ACCOUNT_ID = "c130376d033a4185cd94905fec94abfc"
+
+def push_to_kv(matches):
+    """Push parsed fixtures to Cloudflare KV so the Worker can read them."""
+    import urllib.request
+    
+    # Read CF token
+    cf_token = None
+    for line in open(r"C:/Users/alaga/AppData/Local/hermes/secrets/credentials.env"):
+        if line.startswith("CLOUDFLARE_TOKEN="):
+            cf_token = line.split("=", 1)[1].strip()
+            break
+    
+    if not cf_token:
+        print("[proxy] No CF token found")
+        return False
+    
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE}/values/todays_fixtures"
+    
+    payload = json.dumps({
+        "updated_at": str(__import__("datetime").datetime.now()),
+        "count": len(matches),
+        "matches": matches,
+    })
+    
+    req = urllib.request.Request(url, data=payload.encode(), headers={
+        "Authorization": f"Bearer {cf_token}",
+        "Content-Type": "application/json",
+    }, method="PUT")
+    
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+        return resp.get("success", False)
+    except Exception as e:
+        print(f"[proxy] KV push error: {e}")
+        return False
+
+
+
 app = Flask(__name__)
 
 SPORTYBET_TOKEN = None
@@ -270,6 +311,10 @@ def fetch_url():
             
             # Parse structured matches from the page text
             parsed_matches = parse_sportybet_matches(result["pageText"])
+            
+            # Push to KV so the Worker can read them
+            kv_pushed = push_to_kv(parsed_matches)
+            print(f"[proxy] Pushed {len(parsed_matches)} matches to KV: {kv_pushed}")
             
             return jsonify({
                 "ok": True,
